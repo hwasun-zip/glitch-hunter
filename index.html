@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GLITCH HUNTER</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0a0618; overflow: hidden; }
+    #game { width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="game"></div>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.90.0/dist/phaser.min.js"></script>
+  <script>
+// ===== src/config.js =====
+// =====================================================
+// GLITCH HUNTER - 밸런스 수치 모음
+// 기획 수치는 전부 여기서만 바꿉니다. (코드 수정 없이 튜닝 가능)
+// =====================================================
+window.GH = window.GH || {};
+
+GH.CONFIG = {
+  screen: { width: 960, height: 540 },
+  world: { width: 2400, groundY: 470 },
+  gravity: 1500,
+
+  player: {
+    maxHp: 100,
+    moveSpeed: 260,       // 좌우 이동 속도 (px/s)
+    jumpPower: 620,       // 점프 초기 속도
+    // 3타 콤보: 각 타의 데미지 / 지속시간(ms) / 히트박스 크기 / 넉백
+    combo: [
+      { damage: 8,  duration: 170, range: 52, height: 34, knockback: 60 },
+      { damage: 10, duration: 170, range: 56, height: 36, knockback: 80 },
+      { damage: 18, duration: 260, range: 70, height: 48, knockback: 260 },
+    ],
+    comboWindow: 280,     // 다음 타 입력을 받아주는 시간(ms)
+    dash: {
+      speed: 680,
+      duration: 150,      // 대시 지속 시간(ms) = 무적 시간
+      cooldown: 800,      // 재사용 대기(ms)
+    },
+  },
+
+  hitstop: { normal: 45, finisher: 90 },  // 타격 시 멈칫하는 시간(ms) - 타격감
+};
+
+// 사이버펑크 + 귀여움 팔레트
+GH.COLORS = {
+  bgTop: 0x120a2a,
+  bgBottom: 0x2a0f45,
+  neonPink: 0xff4fd8,
+  neonCyan: 0x35f2ff,
+  neonYellow: 0xffe14f,
+  neonPurple: 0x9b5cff,
+  ground: 0x1c1238,
+  robotBody: 0x7ef0ff,
+  robotFace: 0x1b1f3b,
+  danger: 0xff3b6b,
+};
+
+
+// ===== src/textures.js =====
+// 이미지 파일 없이 도형으로 캐릭터/오브젝트 텍스처를 만듭니다.
+window.GH = window.GH || {};
+
+GH.makeTextures = function (scene) {
+  const C = GH.COLORS;
+  const g = scene.make.graphics({ x: 0, y: 0, add: false });
+
+  // ---- 꼬마 로봇 (플레이어) 44x52 ----
+  g.clear();
+  // 안테나
+  g.lineStyle(3, C.robotBody, 1);
+  g.lineBetween(22, 12, 22, 4);
+  g.fillStyle(C.neonPink, 1);
+  g.fillCircle(22, 4, 4);
+  // 몸통 (둥근 머리 겸 몸)
+  g.fillStyle(C.robotBody, 1);
+  g.fillRoundedRect(4, 10, 36, 30, 10);
+  // 얼굴 화면
+  g.fillStyle(C.robotFace, 1);
+  g.fillRoundedRect(9, 15, 26, 18, 6);
+  // 눈 (오른쪽을 보는 방향)
+  g.fillStyle(C.neonCyan, 1);
+  g.fillRoundedRect(17, 19, 5, 9, 2);
+  g.fillRoundedRect(27, 19, 5, 9, 2);
+  // 볼터치
+  g.fillStyle(C.neonPink, 0.8);
+  g.fillCircle(14, 30, 2);
+  // 다리
+  g.fillStyle(C.robotBody, 1);
+  g.fillRoundedRect(10, 40, 9, 10, 3);
+  g.fillRoundedRect(25, 40, 9, 10, 3);
+  g.generateTexture('robot', 44, 52);
+
+  // ---- 공격 이펙트 (초승달 베기) ----
+  g.clear();
+  g.lineStyle(6, C.neonCyan, 1);
+  g.beginPath();
+  g.arc(10, 30, 26, Phaser.Math.DegToRad(-70), Phaser.Math.DegToRad(70), false);
+  g.strokePath();
+  g.lineStyle(2, 0xffffff, 1);
+  g.beginPath();
+  g.arc(10, 30, 26, Phaser.Math.DegToRad(-60), Phaser.Math.DegToRad(60), false);
+  g.strokePath();
+  g.generateTexture('slash', 44, 60);
+
+  // ---- 훈련용 글리치 더미 40x60 ----
+  g.clear();
+  g.fillStyle(0x3a2a66, 1);
+  g.fillRect(16, 44, 8, 16);           // 받침대
+  g.fillStyle(C.neonPurple, 1);
+  g.fillRoundedRect(2, 4, 36, 42, 8);  // 몸
+  g.fillStyle(C.robotFace, 1);
+  g.fillRoundedRect(7, 10, 26, 16, 5);
+  g.fillStyle(C.danger, 1);            // X자 눈 대신 깨진 픽셀 눈
+  g.fillRect(11, 14, 5, 5);
+  g.fillRect(24, 15, 5, 4);
+  g.fillStyle(C.neonYellow, 1);        // 글리치 조각
+  g.fillRect(30, 30, 6, 3);
+  g.fillRect(4, 36, 4, 3);
+  g.generateTexture('dummy', 40, 60);
+
+  // ---- 파티클 / 잔상용 ----
+  g.clear();
+  g.fillStyle(0xffffff, 1);
+  g.fillRect(0, 0, 4, 4);
+  g.generateTexture('pixel', 4, 4);
+
+  // ---- 발판 ----
+  g.clear();
+  g.fillStyle(C.ground, 1);
+  g.fillRect(0, 0, 160, 18);
+  g.fillStyle(C.neonCyan, 1);
+  g.fillRect(0, 0, 160, 3);
+  g.generateTexture('platform', 160, 18);
+
+  g.destroy();
+};
+
+
+// ===== src/player.js =====
+// 플레이어: 꼬마 로봇 "헌터"
+window.GH = window.GH || {};
+
+GH.Player = class Player {
+  constructor(scene, x, y) {
+    this.scene = scene;
+    this.cfg = GH.CONFIG.player;
+
+    this.sprite = scene.physics.add.sprite(x, y, 'robot');
+    this.sprite.setCollideWorldBounds(true);
+    this.sprite.body.setSize(32, 46).setOffset(6, 6);
+    this.sprite.setDepth(10);
+
+    this.hp = this.cfg.maxHp;
+    this.facing = 1;              // 1 = 오른쪽, -1 = 왼쪽
+    this.state = 'normal';        // normal | attack | dash
+    this.comboIndex = -1;
+    this.comboQueued = false;
+    this.lastAttackEnd = 0;
+    this.dashReadyAt = 0;
+    this.invincible = false;
+    this.hitbox = null;           // 현재 공격 판정 { rect, damage, knockback, hitTargets }
+
+    const kb = scene.input.keyboard;
+    this.keys = kb.addKeys({
+      left: Phaser.Input.Keyboard.KeyCodes.LEFT,
+      right: Phaser.Input.Keyboard.KeyCodes.RIGHT,
+      up: Phaser.Input.Keyboard.KeyCodes.UP,
+      attack: Phaser.Input.Keyboard.KeyCodes.Z,
+      dash: Phaser.Input.Keyboard.KeyCodes.X,
+    });
+  }
+
+  get onGround() {
+    return this.sprite.body.blocked.down || this.sprite.body.touching.down;
+  }
+
+  update(time) {
+    const s = this.sprite;
+    const k = this.keys;
+
+    // ---- 대시 입력 ----
+    if (Phaser.Input.Keyboard.JustDown(k.dash) && time >= this.dashReadyAt && this.state !== 'dash') {
+      this.startDash(time);
+    }
+
+    // ---- 공격 입력 ----
+    if (Phaser.Input.Keyboard.JustDown(k.attack)) {
+      if (this.state === 'attack') {
+        this.comboQueued = true;   // 공격 중 입력 → 다음 타 예약
+      } else if (this.state === 'normal') {
+        const continueCombo = time - this.lastAttackEnd <= this.cfg.comboWindow && this.comboIndex < 2;
+        this.startAttack(time, continueCombo ? this.comboIndex + 1 : 0);
+      }
+    }
+
+    // ---- 이동 / 점프 ----
+    if (this.state === 'normal' || this.state === 'attack') {
+      let dir = 0;
+      if (k.left.isDown) dir -= 1;
+      if (k.right.isDown) dir += 1;
+
+      // 공격 중에는 이동 속도를 줄여 "때리는 느낌"을 살림 (방향 전환은 불가)
+      const speed = this.state === 'attack' ? this.cfg.moveSpeed * 0.25 : this.cfg.moveSpeed;
+      s.setVelocityX(dir * speed);
+      if (dir !== 0 && this.state === 'normal') this.setFacing(dir);
+
+      if (Phaser.Input.Keyboard.JustDown(k.up) && this.onGround) {
+        s.setVelocityY(-this.cfg.jumpPower);
+        this.squash(0.8, 1.2);
+      }
+    }
+
+    // 착지 순간 찌그러짐 (귀여운 느낌)
+    if (this.onGround && !this.wasOnGround) this.squash(1.2, 0.8);
+    this.wasOnGround = this.onGround;
+
+    // 공격 판정 위치를 플레이어에 붙여서 따라오게
+    if (this.hitbox) {
+      const r = this.hitbox.rect;
+      r.x = s.x + this.facing * (r.width / 2 + 10) - r.width / 2;
+      r.y = s.y - r.height / 2;
+      if (this.slashFx) this.slashFx.setPosition(s.x + this.facing * 30, s.y);
+    }
+  }
+
+  setFacing(dir) {
+    this.facing = dir;
+    this.sprite.setFlipX(dir < 0);
+  }
+
+  squash(sx, sy) {
+    this.scene.tweens.killTweensOf(this.sprite);
+    this.sprite.setScale(sx, sy);
+    this.scene.tweens.add({ targets: this.sprite, scaleX: 1, scaleY: 1, duration: 140, ease: 'Back.Out' });
+  }
+
+  startAttack(time, index) {
+    const atk = this.cfg.combo[index];
+    this.state = 'attack';
+    this.comboIndex = index;
+    this.comboQueued = false;
+    const id = this.attackId = (this.attackId || 0) + 1;
+
+    this.hitbox = {
+      rect: new Phaser.Geom.Rectangle(0, 0, atk.range, atk.height),
+      damage: atk.damage,
+      knockback: atk.knockback,
+      finisher: index === 2,
+      hitTargets: new Set(),
+    };
+
+    // 베기 이펙트
+    if (this.slashFx) this.slashFx.destroy();
+    const fx = this.scene.add.image(this.sprite.x + this.facing * 30, this.sprite.y, 'slash').setDepth(11);
+    fx.setFlipX(this.facing < 0);
+    fx.setScale(index === 2 ? 1.5 : 1, index === 2 ? 1.3 : 1);
+    if (index === 1) fx.setFlipY(true);
+    if (index === 2) fx.setTint(GH.COLORS.neonPink);
+    this.slashFx = fx;
+    this.scene.tweens.add({ targets: fx, alpha: 0, duration: atk.duration, onComplete: () => fx.destroy() });
+
+    // 3타는 앞으로 살짝 전진
+    if (index === 2) this.sprite.setVelocityX(this.facing * 200);
+
+    this.scene.time.delayedCall(atk.duration, () => { if (this.attackId === id) this.endAttack(); });
+  }
+
+  endAttack() {
+    if (this.state !== 'attack') return;
+    this.hitbox = null;
+    this.slashFx = null;
+    this.state = 'normal';
+    this.lastAttackEnd = this.scene.time.now;
+    if (this.comboQueued) {
+      // 다음 타 예약이 있으면 이어서, 3타 이후면 새 콤보로
+      this.startAttack(this.scene.time.now, this.comboIndex < 2 ? this.comboIndex + 1 : 0);
+    } else if (this.comboIndex >= 2) {
+      this.comboIndex = -1;  // 3타 후 콤보 초기화
+    }
+  }
+
+  startDash(time) {
+    const d = this.cfg.dash;
+    // 공격 중이어도 대시로 캔슬 가능 (회피 우선)
+    this.hitbox = null;
+    this.attackId = (this.attackId || 0) + 1;  // 진행 중이던 공격 종료 예약 무효화
+    if (this.slashFx) { this.slashFx.destroy(); this.slashFx = null; }
+    this.comboIndex = -1;
+
+    let dir = this.facing;
+    if (this.keys.left.isDown) dir = -1;
+    if (this.keys.right.isDown) dir = 1;
+    this.setFacing(dir);
+
+    this.state = 'dash';
+    this.invincible = true;
+    this.dashReadyAt = time + d.cooldown;
+    this.sprite.body.setAllowGravity(false);
+    this.sprite.setVelocity(dir * d.speed, 0);
+    this.sprite.setAlpha(0.6);
+
+    // 잔상
+    const trail = this.scene.time.addEvent({
+      delay: 30, repeat: Math.floor(d.duration / 30),
+      callback: () => {
+        const ghost = this.scene.add.image(this.sprite.x, this.sprite.y, 'robot')
+          .setFlipX(this.facing < 0).setTint(GH.COLORS.neonCyan).setAlpha(0.5).setDepth(9);
+        this.scene.tweens.add({ targets: ghost, alpha: 0, duration: 200, onComplete: () => ghost.destroy() });
+      },
+    });
+
+    this.scene.time.delayedCall(d.duration, () => {
+      trail.remove();
+      this.sprite.body.setAllowGravity(true);
+      this.sprite.setVelocityX(0);
+      this.sprite.setAlpha(1);
+      this.invincible = false;
+      this.state = 'normal';
+    });
+  }
+
+  dashCooldownRatio(time) {
+    const d = this.cfg.dash;
+    if (time >= this.dashReadyAt) return 1;
+    return 1 - (this.dashReadyAt - time) / d.cooldown;
+  }
+};
+
+
+// ===== src/scenes/TrainingScene.js =====
+// SECTOR 0: 훈련 구역 - 조작감 확인용
+window.GH = window.GH || {};
+
+GH.TrainingScene = class TrainingScene extends Phaser.Scene {
+  constructor() { super('Training'); }
+
+  create() {
+    const W = GH.CONFIG.world.width;
+    const H = GH.CONFIG.screen.height;
+    const groundY = GH.CONFIG.world.groundY;
+    GH.makeTextures(this);
+
+    this.physics.world.setBounds(0, 0, W, H);
+    this.cameras.main.setBounds(0, 0, W, H);
+
+    this.drawBackground(W, H, groundY);
+
+    // ---- 바닥과 발판 ----
+    this.solids = this.physics.add.staticGroup();
+    const ground = this.add.rectangle(W / 2, groundY + 35, W, 70, GH.COLORS.ground);
+    this.physics.add.existing(ground, true);
+    this.solids.add(ground);
+    [[520, 360], [820, 290], [1300, 350], [1650, 300], [2000, 370]].forEach(([x, y]) => {
+      this.solids.create(x, y, 'platform');
+    });
+
+    // ---- 플레이어 ----
+    this.player = new GH.Player(this, 140, groundY - 60);
+    this.physics.add.collider(this.player.sprite, this.solids);
+    this.cameras.main.startFollow(this.player.sprite, true, 0.12, 0.12);
+
+    // ---- 훈련용 더미 ----
+    this.dummies = [];
+    [700, 1150, 1900].forEach((x) => this.spawnDummy(x, groundY - 30));
+
+    this.createHud();
+  }
+
+  drawBackground(W, H, groundY) {
+    const C = GH.COLORS;
+    const sky = this.add.graphics().setScrollFactor(0);
+    sky.fillGradientStyle(C.bgTop, C.bgTop, C.bgBottom, C.bgBottom, 1);
+    sky.fillRect(0, 0, GH.CONFIG.screen.width, H);
+
+    // 별 / 데이터 입자
+    const stars = this.add.graphics().setScrollFactor(0.1);
+    for (let i = 0; i < 80; i++) {
+      stars.fillStyle(Phaser.Math.RND.pick([C.neonCyan, C.neonPink, 0xffffff]), Phaser.Math.FloatBetween(0.3, 0.9));
+      stars.fillRect(Phaser.Math.Between(0, W), Phaser.Math.Between(0, groundY - 150), 2, 2);
+    }
+
+    // 먼 빌딩 (느리게 움직임) / 가까운 빌딩 (빠르게)
+    const layers = [
+      { factor: 0.3, color: 0x221447, minH: 120, maxH: 260, win: C.neonPurple },
+      { factor: 0.6, color: 0x170d33, minH: 80, maxH: 200, win: C.neonPink },
+    ];
+    layers.forEach((L) => {
+      const g = this.add.graphics().setScrollFactor(L.factor);
+      let x = -50;
+      while (x < W * L.factor + GH.CONFIG.screen.width + 100) {
+        const bw = Phaser.Math.Between(60, 130);
+        const bh = Phaser.Math.Between(L.minH, L.maxH);
+        g.fillStyle(L.color, 1);
+        g.fillRect(x, groundY - bh, bw, bh);
+        // 네온 창문
+        for (let wy = groundY - bh + 12; wy < groundY - 10; wy += 18) {
+          for (let wx = x + 8; wx < x + bw - 10; wx += 16) {
+            if (Math.random() < 0.35) {
+              g.fillStyle(L.win, Phaser.Math.FloatBetween(0.3, 0.8));
+              g.fillRect(wx, wy, 6, 4);
+            }
+          }
+        }
+        x += bw + Phaser.Math.Between(6, 30);
+      }
+    });
+
+    // 바닥 네온 라인
+    const floor = this.add.graphics();
+    floor.lineStyle(2, C.neonCyan, 0.9);
+    floor.lineBetween(0, groundY, W, groundY);
+    floor.lineStyle(1, C.neonPurple, 0.35);
+    for (let x = 0; x < W; x += 60) floor.lineBetween(x, groundY, x - 40, H);
+  }
+
+  spawnDummy(x, y) {
+    const d = this.add.image(x, y, 'dummy').setDepth(5);
+    d.maxHp = 60;
+    d.hp = d.maxHp;
+    d.homeX = x;
+    d.hpBar = this.add.graphics().setDepth(6);
+    this.dummies.push(d);
+    this.drawDummyHp(d);
+  }
+
+  drawDummyHp(d) {
+    d.hpBar.clear();
+    if (!d.visible) return;
+    d.hpBar.fillStyle(0x000000, 0.6).fillRect(d.x - 22, d.y - 44, 44, 5);
+    d.hpBar.fillStyle(GH.COLORS.danger, 1).fillRect(d.x - 22, d.y - 44, 44 * (d.hp / d.maxHp), 5);
+  }
+
+  update(time) {
+    this.player.update(time);
+    this.checkHits();
+    this.dummies.forEach((d) => this.drawDummyHp(d));
+    this.updateHud(time);
+  }
+
+  checkHits() {
+    const hb = this.player.hitbox;
+    if (!hb) return;
+    this.dummies.forEach((d) => {
+      if (!d.visible || hb.hitTargets.has(d)) return;
+      if (Phaser.Geom.Intersects.RectangleToRectangle(hb.rect, d.getBounds())) {
+        hb.hitTargets.add(d);
+        this.onHit(d, hb);
+      }
+    });
+  }
+
+  onHit(target, hb) {
+    target.hp = Math.max(0, target.hp - hb.damage);
+
+    // 타격감: 멈칫(히트스톱) + 흰색 번쩍 + 밀림 + 숫자
+    const stop = hb.finisher ? GH.CONFIG.hitstop.finisher : GH.CONFIG.hitstop.normal;
+    this.physics.world.pause();
+    this.time.delayedCall(stop, () => this.physics.world.resume());
+
+    target.setTintFill(0xffffff);
+    this.time.delayedCall(60, () => target.clearTint());
+
+    const push = this.player.facing * hb.knockback * 0.15;
+    this.tweens.killTweensOf(target);
+    target.x = target.homeX;
+    this.tweens.add({
+      targets: target, x: target.homeX + push, duration: 80, yoyo: true, ease: 'Quad.Out',
+      onComplete: () => { target.x = target.homeX; },
+    });
+
+    if (hb.finisher) this.cameras.main.shake(120, 0.008);
+
+    this.popDamage(target.x, target.y - 50, hb.damage, hb.finisher);
+    this.burst(target.x, target.y, hb.finisher ? 14 : 6, GH.COLORS.neonCyan);
+
+    if (target.hp <= 0) this.breakDummy(target);
+  }
+
+  popDamage(x, y, dmg, big) {
+    const t = this.add.text(x, y, String(dmg), {
+      fontFamily: 'Pretendard, "Noto Sans KR", sans-serif',
+      fontSize: big ? '30px' : '20px',
+      fontStyle: 'bold',
+      color: big ? '#ffe14f' : '#ffffff',
+      stroke: '#ff4fd8', strokeThickness: 4,
+    }).setOrigin(0.5).setDepth(20);
+    this.tweens.add({ targets: t, y: y - 40, alpha: 0, duration: 600, ease: 'Cubic.Out', onComplete: () => t.destroy() });
+  }
+
+  burst(x, y, n, color) {
+    for (let i = 0; i < n; i++) {
+      const p = this.add.image(x, y, 'pixel').setTint(Phaser.Math.RND.pick([color, GH.COLORS.neonPink, GH.COLORS.neonYellow])).setDepth(15);
+      const ang = Phaser.Math.FloatBetween(0, Math.PI * 2);
+      const dist = Phaser.Math.Between(20, 70);
+      this.tweens.add({
+        targets: p, x: x + Math.cos(ang) * dist, y: y + Math.sin(ang) * dist,
+        alpha: 0, scale: 0.3, duration: Phaser.Math.Between(250, 500), onComplete: () => p.destroy(),
+      });
+    }
+  }
+
+  breakDummy(d) {
+    this.burst(d.x, d.y, 30, GH.COLORS.neonPurple);
+    d.setVisible(false);
+    this.time.delayedCall(1500, () => {
+      d.hp = d.maxHp;
+      d.x = d.homeX;
+      d.setVisible(true).setAlpha(0);
+      this.tweens.add({ targets: d, alpha: 1, duration: 300 });
+    });
+  }
+
+  createHud() {
+    const font = { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', color: '#ffffff' };
+    this.add.text(20, 16, 'GLITCH HUNTER', { ...font, fontSize: '22px', fontStyle: 'bold', color: '#35f2ff' })
+      .setScrollFactor(0).setDepth(100);
+    this.add.text(20, 44, 'SECTOR 0 · 훈련 구역', { ...font, fontSize: '14px', color: '#ff4fd8' })
+      .setScrollFactor(0).setDepth(100);
+    this.add.text(940, 16, '← → 이동   ↑ 점프   Z 공격(3타)   X 대시', { ...font, fontSize: '14px' })
+      .setOrigin(1, 0).setScrollFactor(0).setDepth(100).setAlpha(0.85);
+
+    this.hud = this.add.graphics().setScrollFactor(0).setDepth(100);
+    this.add.text(20, 72, 'HP', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
+    this.add.text(20, 92, 'DASH', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
+  }
+
+  updateHud(time) {
+    const p = this.player;
+    const g = this.hud;
+    g.clear();
+    g.fillStyle(0x000000, 0.5).fillRect(60, 74, 160, 10);
+    g.fillStyle(GH.COLORS.neonCyan, 1).fillRect(60, 74, 160 * (p.hp / p.cfg.maxHp), 10);
+    const r = p.dashCooldownRatio(time);
+    g.fillStyle(0x000000, 0.5).fillRect(60, 94, 80, 8);
+    g.fillStyle(r >= 1 ? GH.COLORS.neonYellow : GH.COLORS.neonPurple, 1).fillRect(60, 94, 80 * r, 8);
+  }
+};
+
+
+// ===== src/main.js =====
+// 게임 시작점
+window.addEventListener('load', () => {
+  const S = GH.CONFIG.screen;
+  window.game = new Phaser.Game({
+    type: Phaser.AUTO,
+    parent: 'game',
+    width: S.width,
+    height: S.height,
+    backgroundColor: '#120a2a',
+    physics: {
+      default: 'arcade',
+      arcade: { gravity: { y: GH.CONFIG.gravity }, debug: false },
+    },
+    scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+    scene: [GH.TrainingScene],
+  });
+});
+
+  </script>
+</body>
+</html>
