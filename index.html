@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v0.11',
+  version: 'v1.0',   // 플레이테스트용 확정 버전 (테스트 기간에는 게임 내용 변경 금지)
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -456,6 +456,10 @@ GH.Run = {
     this.ready = true;
     const params = new URLSearchParams(location.search);
     this.debug = params.get('debug') === '1';
+    // 유입 출처: 링크의 ?src=이름 (예: friends, disquiet). 없으면 이전 페이지 주소의 도메인, 그것도 없으면 direct
+    let ref = '';
+    try { ref = document.referrer ? new URL(document.referrer).hostname : ''; } catch (e) { ref = ''; }
+    this.src = (params.get('src') || ref || 'direct').slice(0, 40);
 
     // 플레이어 ID와 그룹은 브라우저에 저장: 같은 사람이 두 그룹에 섞이지 않도록
     this.playerId = this.store('gh_player') || this.store('gh_player', this.rid());
@@ -475,7 +479,9 @@ GH.Run = {
     this.current = null;
     this.local = this.loadLocal();
 
-    this.log('session_start', { ua: navigator.userAgent.slice(0, 120) });
+    // 출처와 기기 정보는 시트의 상세(JSON) 열에 기록
+    const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+    this.log('session_start', { pattern_hits: { src: this.src, ref, mobile } });
 
     // 창을 닫으면 진행 중인 시도를 "이탈"로 기록
     window.addEventListener('pagehide', () => { if (this.current) this.endAttempt('quit', {}, true); });
