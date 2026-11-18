@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v0.6',
+  version: 'v0.8',
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -120,6 +120,10 @@ GH.CONFIG = {
     charge: { telegraph: 850, speed: 640, damage: 18, stagger: 900 },
     slam:   { follow: 650, lock: 400, radius: 110, damage: 20, recover: 750 },
     fan:    { telegraph: 750, bullets: 7, spread: 70, speed: 290, volleys: 2, gap: 450, damage: 8 },
+    // 2페이즈 전용: 레이저 스윕. 예고선이 낮으면 점프, 높으면 땅에서 버티기 (방패 불가)
+    // 2페이즈 전용: 미러 클론. 양쪽 끝의 진짜(눈 깜빡)와 가짜(반투명 지직)가 동시에 돌진, 진짜만 피해
+    mirror: { telegraph: 1200, speed: 520, damage: 18, stagger: 900 },
+    sweep:  { telegraph: 850, beam: 450, gap: 250, count: 3, damage: 15, lowY: 450, highY: 378, thickness: 26 },
     // 무력화 필살기: 제한 시간 안에 게이지를 깎으면 그로기, 실패하면 최대 HP의 50% 피해
     overload: {
       triggers: [0.7, 0.35],      // HP가 이 비율 아래로 떨어질 때 발동
@@ -1540,8 +1544,14 @@ GH.Boss = class Boss extends GH.Enemy {
     const time = scene.time.now;
     let dmg = damage;
     if (this.state === 'groggy') dmg = Math.round(damage * this.bcfg.overload.groggyDamageMul);
-    this.hp = Math.max(0, this.hp - dmg);
-    this.lastDamage = dmg;
+    // 무력화 지점(70%, 35%)을 지나치지 않도록: 아직 발동하지 않은 지점에서 HP를 멈추고 무력화 예약
+    const next = this.bcfg.overload.triggers.find((r) => !this.overloadDone.includes(r) && this.hp > this.maxHp * r);
+    let floor = 0;
+    if (next !== undefined) floor = Math.ceil(this.maxHp * next);
+    const before = this.hp;
+    this.hp = Math.max(floor, this.hp - dmg);
+    this.lastDamage = before - this.hp;
+    if (floor > 0 && this.hp === floor) this.pendingOverload = next;
 
     if (this.state === 'overload') {
       this.ovGauge = Math.max(0, this.ovGauge - damage);
@@ -1573,6 +1583,8 @@ GH.Boss = class Boss extends GH.Enemy {
     // 무력화 중에는 몸에 닿아도 피해 없음 (점프해서 때리러 오는 플레이어를 벌주지 않도록)
     if (this.state === 'overload' || this.state === 'overload_move') return 0;
     if (this.state === 'charge') return this.bcfg.charge.damage;
+    if (this.state === 'mirror_charge') return this.bcfg.mirror.damage;
+    if (this.state === 'mirror_move') return 0;
     return this.bcfg.touchDamage;
   }
 
@@ -1588,12 +1600,15 @@ GH.Boss = class Boss extends GH.Enemy {
       this.overloadDone.push(trig);
       return this.startOverload(time);
     }
-    const pool = ['charge', 'slam', 'fan'].filter((p) => p !== this.lastPattern);
+    const base = this.phase === 2 ? ['charge', 'slam', 'fan', 'sweep', 'mirror'] : ['charge', 'slam', 'fan'];
+    const pool = base.filter((p) => p !== this.lastPattern);
     const p = Phaser.Math.RND.pick(pool);
     this.lastPattern = p;
     if (p === 'charge') this.startChargeTelegraph(time);
     if (p === 'slam') this.startSlam(time);
     if (p === 'fan') this.startFanTelegraph(time);
+    if (p === 'sweep') this.startSweep(time);
+    if (p === 'mirror') this.startMirror(time);
   }
 
   update(time, player) {
@@ -1602,6 +1617,20 @@ GH.Boss = class Boss extends GH.Enemy {
     const p = player.sprite;
     const c = this.bcfg;
     s.setVelocityY(0);
+
+    // 예약된 무력화: 끊어도 되는 상태라면 바로 시작
+    const interruptible = ['idle', 'stagger', 'slam_recover', 'charge_tel', 'fan_tel', 'sweep_tel', 'mirror_tel'];
+    if (this.pendingOverload !== undefined && interruptible.includes(this.state)) {
+      this.overloadDone.push(this.pendingOverload);
+      this.pendingOverload = undefined;
+      this.tele.clear();
+      if (this.sweepLabel) this.sweepLabel.setVisible(false);
+      this.clearMirror();
+      this.applyTint();
+      s.setVelocityX(0);
+      this.startOverload(time);
+      return;
+    }
 
     switch (this.state) {
       case 'intro':
@@ -1667,6 +1696,59 @@ GH.Boss = class Boss extends GH.Enemy {
           if (this.volleysLeft > 0) this.setState('fan_tel', time, c.fan.gap);
           else { this.view.clearTint(); this.applyTint(); this.setState('idle', time, this.t(c.idle)); }
         }
+        break;
+
+      // ---- 6. 미러 클론 (2페이즈 전용) ----
+      case 'mirror_move':
+        break;
+      case 'mirror_tel':
+        this.updateMirrorTelegraph(time);
+        if (time >= this.stateUntil) {
+          this.tele.clear();
+          this.view.clearTint(); this.applyTint();
+          this.setState('mirror_charge', time, 3000);
+        }
+        break;
+      case 'mirror_charge': {
+        const m = this.bcfg.mirror;
+        s.setVelocityX(this.facing * m.speed * this.d);
+        if (Math.floor(time / 30) % 2) this.afterImage(GH.COLORS.danger);
+        this.updateFake(time, true);
+        if (s.body.blocked.left || s.body.blocked.right || time >= this.stateUntil) {
+          s.setVelocityX(0);
+          this.clearMirror();
+          this.scene.cameras.main.shake(200, 0.012);
+          GH.Sfx.slam();
+          this.view.setAngle(this.facing * -10);
+          this.setState('stagger', time, m.stagger);
+        }
+        break;
+      }
+
+      // ---- 5. 레이저 스윕 (2페이즈 전용) ----
+      case 'sweep_move':
+        break;
+      case 'sweep_tel':
+        this.drawSweep(time, false);
+        if (time >= this.stateUntil) { this.setState('sweep_on', time, c.sweep.beam); GH.Sfx.laser(); this.scene.cameras.main.shake(c.sweep.beam, 0.004); }
+        break;
+      case 'sweep_on':
+        this.drawSweep(time, true);
+        this.checkSweepHit(player);
+        if (time >= this.stateUntil) {
+          this.sweepLeft -= 1;
+          this.tele.clear();
+          if (this.sweepLeft > 0) {
+            this.nextSweepLow();
+            this.setState('sweep_gap', time, c.sweep.gap);
+          } else {
+            this.scene.tweens.add({ targets: s, y: this.groundY, duration: 300 });
+            this.setState('idle', time, this.t(c.idle));
+          }
+        }
+        break;
+      case 'sweep_gap':
+        if (time >= this.stateUntil) { this.setState('sweep_tel', time, this.t(c.sweep.telegraph)); GH.Sfx.laserWarn(); }
         break;
 
       // ---- 4. 무력화 필살기 ----
@@ -1781,6 +1863,161 @@ GH.Boss = class Boss extends GH.Enemy {
       this.scene.spawnBullet(s.x, s.y, Math.cos(a) * sp, Math.sin(a) * sp, f.damage, 'boss_fan');
     }
     GH.Sfx.shoot();
+  }
+
+  // ===== 미러 클론 (2페이즈 전용) =====
+  startMirror(time) {
+    const scene = this.scene;
+    const W = GH.CONFIG.screen.width;
+    const realLeft = Math.random() < 0.5;
+    const realX = realLeft ? 70 : W - 70;
+    const fakeX = realLeft ? W - 70 : 70;
+    scene.bossCallout('미러!');
+    GH.Sfx.bossWarn();
+    this.setState('mirror_move', time, 99999);
+    // 글리치 순간이동: 깜빡이며 진짜는 한쪽 끝으로
+    scene.tweens.add({ targets: this.view, alpha: 0.2, duration: 80, yoyo: true, repeat: 2 });
+    scene.time.delayedCall(300, () => {
+      if (!this.alive) return;
+      this.sprite.setPosition(realX, this.groundY);
+      this.setFacing(realLeft ? 1 : -1);
+      // 가짜: 보이기만 하는 분신
+      this.fake = scene.add.image(fakeX, this.groundY, 'boss').setDepth(7).setFlipX(!realLeft ? false : true);
+      this.fake.dir = realLeft ? -1 : 1;
+      this.fake.setFlipX(this.fake.dir < 0);
+      this.fake.alive = true;
+      this.fakeHit = new Set();
+      GH.Sfx.overload();
+      this.setState('mirror_tel', scene.time.now, this.t(this.bcfg.mirror.telegraph));
+    });
+  }
+
+  updateMirrorTelegraph(time) {
+    const g = this.tele;
+    g.clear();
+    const gy = this.groundY;
+    // 양쪽에서 가운데로 향하는 돌진 예고 띠
+    const blink = Math.floor(time / 90) % 2;
+    g.fillStyle(GH.COLORS.danger, blink ? 0.22 : 0.1).fillRect(0, gy - 45, GH.CONFIG.screen.width, 90);
+    // 진짜: 눈이 노랗게 깜빡
+    const pulse = Math.floor(time / 220) % 2;
+    if (pulse) this.view.setTint(GH.COLORS.neonYellow); else this.applyTint();
+    this.view.setAlpha(1);
+    this.updateFake(time, false);
+  }
+
+  // 가짜 분신: 반투명 + 지직거림. 예고 중 공격받으면 깨짐, 돌진 중엔 피해 없이 통과
+  updateFake(time, moving) {
+    const f = this.fake;
+    if (!f || !f.alive) return;
+    const scene = this.scene;
+    if (moving) f.x += f.dir * this.bcfg.mirror.speed * this.d * (scene.game.loop.delta / 1000);
+    f.setAlpha(0.45 + Math.random() * 0.25);
+    f.y = this.groundY + Phaser.Math.Between(-2, 2);
+    f.setTint(Phaser.Math.RND.pick([0xff6080, 0x60f0ff, 0xb090ff]));
+    if (moving && Math.floor(time / 30) % 2) {
+      const ghost = scene.add.image(f.x, f.y, 'boss').setFlipX(f.flipX).setTint(GH.COLORS.neonCyan).setAlpha(0.2).setDepth(6);
+      scene.tweens.add({ targets: ghost, alpha: 0, duration: 160, onComplete: () => ghost.destroy() });
+    }
+    if (f.x < -80 || f.x > GH.CONFIG.screen.width + 80) { this.clearMirror(); return; }
+    if (moving) return;
+    // 예고 중: 플레이어 공격(근접, 파동, 사격)에 닿으면 깨짐
+    const fb = f.getBounds();
+    const pl = scene.player;
+    let hit = pl.hitbox && Phaser.Geom.Intersects.RectangleToRectangle(pl.hitbox.rect, fb);
+    if (!hit && scene.waves) hit = scene.waves.some((w) => Phaser.Geom.Intersects.RectangleToRectangle(w.img.getBounds(), fb));
+    if (!hit && scene.pbullets) {
+      scene.pbullets.getChildren().forEach((b) => {
+        if (!hit && Phaser.Geom.Intersects.RectangleToRectangle(b.getBounds(), fb)) { hit = true; b.destroy(); }
+      });
+    }
+    if (hit) this.shatterFake();
+  }
+
+  shatterFake() {
+    const f = this.fake;
+    const scene = this.scene;
+    f.alive = false;
+    GH.Sfx.parry();
+    scene.popText(f.x, f.y - 60, 'FAKE!', '#35f2ff', 26);
+    scene.burst(f.x, f.y, 30, GH.COLORS.neonCyan);
+    scene.tweens.add({ targets: f, scaleX: 1.6, scaleY: 0.1, alpha: 0, duration: 220, onComplete: () => f.destroy() });
+    this.fake = null;
+  }
+
+  clearMirror() {
+    if (this.fake) {
+      const f = this.fake;
+      this.fake = null;
+      this.scene.tweens.add({ targets: f, alpha: 0, duration: 200, onComplete: () => f.destroy() });
+    }
+  }
+
+  sourceName(kind) {
+    if (this.state === 'mirror_charge') return 'boss_mirror';
+    return `boss_${kind}`;
+  }
+
+  // ===== 레이저 스윕 (2페이즈 전용) =====
+  startSweep(time) {
+    const scene = this.scene;
+    const c = this.bcfg.sweep;
+    // 플레이어에게서 먼 쪽 화면 끝으로 이동
+    const W = GH.CONFIG.screen.width;
+    const toLeft = scene.player.sprite.x > W / 2;
+    this.sweepX = toLeft ? 70 : W - 70;
+    this.setFacing(toLeft ? 1 : -1);
+    this.sweepLeft = c.count;
+    // 높낮이를 섞되, 낮은 것과 높은 것이 최소 한 번씩 나오도록
+    const seq = [true, false, Phaser.Math.RND.pick([true, false])];
+    this.sweepSeq = Phaser.Utils.Array.Shuffle(seq);
+    this.nextSweepLow();
+    scene.bossCallout('레이저!');
+    GH.Sfx.bossWarn();
+    this.setState('sweep_move', time, 99999);
+    scene.tweens.add({
+      targets: this.sprite, x: this.sweepX, y: this.groundY - 40, duration: 500, ease: 'Sine.InOut',
+      onComplete: () => this.setState('sweep_tel', scene.time.now, this.t(c.telegraph)),
+    });
+  }
+
+  nextSweepLow() {
+    this.sweepLow = this.sweepSeq[this.bcfg.sweep.count - this.sweepLeft];
+  }
+
+  drawSweep(time, on) {
+    const c = this.bcfg.sweep;
+    const y = this.sweepLow ? c.lowY : c.highY;
+    const W = GH.CONFIG.screen.width;
+    const g = this.tele;
+    g.clear();
+    if (!on) {
+      // 예고: 깜빡이는 점선 + 대처 표시
+      const blink = Math.floor(time / 100) % 2;
+      g.lineStyle(2, GH.COLORS.danger, blink ? 1 : 0.4);
+      for (let x = 0; x < W; x += 24) g.lineBetween(x, y, x + 12, y);
+      g.fillStyle(GH.COLORS.danger, 0.12).fillRect(0, y - c.thickness / 2, W, c.thickness);
+      if (!this.sweepLabel) {
+        this.sweepLabel = this.scene.add.text(0, 0, '', {
+          fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', fontSize: '15px', fontStyle: 'bold',
+          color: '#ffe14f', stroke: '#000000', strokeThickness: 4,
+        }).setOrigin(0.5).setDepth(20);
+      }
+      this.sweepLabel.setText(this.sweepLow ? '▲ 점프!' : '▼ 땅에서 버텨!').setPosition(W / 2, y - 26).setVisible(true);
+    } else {
+      if (this.sweepLabel) this.sweepLabel.setVisible(false);
+      g.fillStyle(GH.COLORS.danger, 0.45).fillRect(0, y - c.thickness / 2, W, c.thickness);
+      g.fillStyle(0xffffff, 0.95).fillRect(0, y - 4, W, 8);
+    }
+  }
+
+  checkSweepHit(player) {
+    const c = this.bcfg.sweep;
+    const y = this.sweepLow ? c.lowY : c.highY;
+    const b = player.sprite.getBounds();
+    if (b.bottom > y - c.thickness / 2 && b.top < y + c.thickness / 2) {
+      player.takeDamage(c.damage, this.sprite.x, 'hazard', 'boss_sweep');
+    }
   }
 
   // ===== 무력화 필살기 =====
@@ -2030,8 +2267,9 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       if (e.alive && !e.untargetable && this.player.state !== 'dead') {
         const dmg = e.contactDamage();
         if (dmg > 0 && Phaser.Geom.Intersects.RectangleToRectangle(this.player.sprite.getBounds(), e.sprite.getBounds())) {
-          const kind = (e.state === 'charge' || e.state === 'bash') ? 'charge' : 'touch';
-          const r = this.player.takeDamage(dmg, e.sprite.x, kind, `${e.name}_${kind}`);
+          const kind = (e.state === 'charge' || e.state === 'bash' || e.state === 'mirror_charge') ? 'charge' : 'touch';
+          const src = e.sourceName ? e.sourceName(kind) : `${e.name}_${kind}`;
+          const r = this.player.takeDamage(dmg, e.sprite.x, kind, src);
           if (r === 'blocked') {
             // 방패에 막힌 적은 튕겨 나가며 경직
             e.hit(0, this.player.facing, kind === 'charge' ? 420 : 240, false);
@@ -2469,6 +2707,8 @@ GH.BossScene = class BossScene extends GH.SectorScene {
   onEnemyKilled(e) {
     this.kills += 1;
     if (this.boss.tele) this.boss.tele.destroy();
+    if (this.boss.sweepLabel) this.boss.sweepLabel.destroy();
+    this.boss.clearMirror();
     this.cleared = true;
     GH.Run.endAttempt('clear', { hp_left: this.player.hp });
     // 보스 처치 연출: 슬로모션 + 연쇄 폭발
