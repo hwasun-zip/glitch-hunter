@@ -21,7 +21,21 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
+  version: 'v0.3',
   screen: { width: 960, height: 540 },
+
+  // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
+  log: { endpoint: '' },
+
+  // ===== 적응형 난이도 =====
+  adaptive: {
+    risePerSector: 0.10,   // 기본 상승: 보스는 섹터 1보다 10% 어려움 (두 그룹 공통)
+    range: 0.20,           // 실력 보정 폭: ±20% (adaptive 그룹만)
+    deathEase: 0.05,       // 보스에서 죽을 때마다 5%씩 완화 (adaptive 그룹만)
+    // 실력 점수 기준: 섹터 1을 피격 6회, 100초 안팎으로 깨면 보통(0점)
+    targetHits: 6, targetTime: 100, hitWeight: 0.6, timeWeight: 0.4,
+    hitsPerDeath: 3,       // 섹터 1에서 한 번 죽으면 피격 3회로 환산
+  },
   world: { width: 2600, groundY: 470 },
   gravity: 1500,
 
@@ -363,6 +377,162 @@ GH.Sfx = {
 };
 
 
+// ===== src/analytics.js =====
+// =====================================================
+// 3층: 플레이 로그 + 적응형 난이도 + A/B 배정
+// - 개인정보 없이 무작위 익명 ID만 사용
+// - 그룹: control(보정 끔) / adaptive(보정 켬). 두 그룹의 화면과 문구는 동일하고 수치만 다름
+// =====================================================
+window.GH = window.GH || {};
+
+GH.Run = {
+  init() {
+    if (this.ready) return;
+    this.ready = true;
+    const params = new URLSearchParams(location.search);
+    this.debug = params.get('debug') === '1';
+
+    // 플레이어 ID와 그룹은 브라우저에 저장: 같은 사람이 두 그룹에 섞이지 않도록
+    this.playerId = this.store('gh_player') || this.store('gh_player', this.rid());
+    let group = params.get('group');
+    if (group !== 'control' && group !== 'adaptive') {
+      group = this.store('gh_group') || (Math.random() < 0.5 ? 'control' : 'adaptive');
+    }
+    this.group = this.store('gh_group', group);
+
+    this.sessionId = this.rid();            // 페이지를 열 때마다 새 세션
+    this.version = GH.CONFIG.version;
+    this.attempts = { S1: 0, BOSS: 0 };
+    this.deaths = { S1: 0, BOSS: 0 };
+    this.skill = null;                       // 섹터 1 클리어 시 계산되는 실력 점수 (-1 ~ 1)
+    this.current = null;
+    this.local = this.loadLocal();
+
+    this.log('session_start', { ua: navigator.userAgent.slice(0, 120) });
+
+    // 창을 닫거나 다른 탭으로 가면 진행 중인 시도를 "이탈"로 기록
+    const quit = () => { if (this.current) this.endAttempt('quit', {}, true); };
+    window.addEventListener('pagehide', quit);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') quit(); });
+  },
+
+  rid() { return Math.random().toString(36).slice(2, 10); },
+
+  store(key, value) {
+    try {
+      if (value === undefined) return localStorage.getItem(key);
+      localStorage.setItem(key, value);
+    } catch (e) { /* 저장소를 못 쓰는 환경 */ }
+    return value;
+  },
+
+  loadLocal() {
+    try { return JSON.parse(localStorage.getItem('gh_logs') || '[]'); } catch (e) { return []; }
+  },
+
+  // ===== 시도 단위 기록 =====
+  startAttempt(sector) {
+    this.attempts[sector] += 1;
+    this.current = {
+      sector, attempt: this.attempts[sector], t0: Date.now(),
+      hits: 0, damage: 0, patternHits: {}, overload: [], difficulty: this.difficultyFor(sector),
+    };
+    this.log('attempt_start', { sector, attempt: this.current.attempt, difficulty: this.current.difficulty });
+    return this.current.difficulty;
+  },
+
+  hit(amount, source) {
+    const c = this.current;
+    if (!c) return;
+    c.hits += 1;
+    c.damage += amount;
+    c.patternHits[source] = (c.patternHits[source] || 0) + 1;
+    c.lastSource = source;
+  },
+
+  overloadResult(success) {
+    if (this.current) this.current.overload.push(success ? 1 : 0);
+  },
+
+  endAttempt(result, extra = {}, beacon = false) {
+    const c = this.current;
+    if (!c) return;
+    this.current = null;
+    const duration = Math.round((Date.now() - c.t0) / 100) / 10;
+    if (result === 'death') this.deaths[c.sector] += 1;
+    const row = {
+      sector: c.sector, attempt: c.attempt, result, duration_s: duration,
+      hits_taken: c.hits, damage_taken: c.damage, cause: result === 'death' ? c.lastSource : '',
+      overload: c.overload.join(''), pattern_hits: c.patternHits, difficulty: c.difficulty,
+      ...extra,
+    };
+    if (c.sector === 'S1' && result === 'clear') {
+      this.skill = GH.Adaptive.skillScore(c.hits, duration, this.deaths.S1);
+      row.skill_score = this.skill;
+    }
+    this.log('attempt_end', row, beacon);
+  },
+
+  difficultyFor(sector) {
+    if (sector === 'S1') return 1;
+    return GH.Adaptive.bossDifficulty(this.group, this.skill, this.deaths.BOSS);
+  },
+
+  // ===== 전송 =====
+  log(event, data = {}, beacon = false) {
+    const rec = {
+      time: new Date().toISOString(), player: this.playerId, session: this.sessionId,
+      group: this.group, version: this.version, debug: this.debug ? 1 : 0, event, ...data,
+    };
+    this.local.push(rec);
+    try { localStorage.setItem('gh_logs', JSON.stringify(this.local.slice(-500))); } catch (e) { /* 무시 */ }
+    if (this.debug) console.log('[GH log]', rec);
+
+    const url = GH.CONFIG.log.endpoint;
+    if (!url) return;
+    const body = JSON.stringify(rec);
+    try {
+      if (beacon && navigator.sendBeacon) navigator.sendBeacon(url, body);
+      else fetch(url, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain' }, body });
+    } catch (e) { /* 네트워크 실패는 게임에 영향 없음 */ }
+  },
+
+  downloadLogs() {
+    const blob = new Blob([JSON.stringify(this.local, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `glitch-hunter-logs-${this.playerId}.json`;
+    a.click();
+  },
+};
+
+// ===== 적응형 난이도 =====
+GH.Adaptive = {
+  // 실력 점수: 섹터 1을 적게 맞고 빨리 깰수록 +, 많이 맞고 오래 걸리거나 죽었으면 -
+  skillScore(hits, durationSec, deaths) {
+    const a = GH.CONFIG.adaptive;
+    const effHits = hits + deaths * a.hitsPerDeath;
+    const hitPart = (a.targetHits - effHits) / a.targetHits;
+    const timePart = (a.targetTime - durationSec) / a.targetTime;
+    const s = hitPart * a.hitWeight + timePart * a.timeWeight;
+    return Math.round(Phaser.Math.Clamp(s, -1, 1) * 100) / 100;
+  },
+
+  // 보스 난이도 배율
+  // control: 기본 상승만 (1.10 고정)
+  // adaptive: 기본 상승 x 실력 보정(±20%) x 보스에서 죽을 때마다 완화(-5%), 최종 범위 0.8~1.32
+  bossDifficulty(group, skill, bossDeaths) {
+    const a = GH.CONFIG.adaptive;
+    const base = 1 + a.risePerSector;
+    if (group !== 'adaptive') return base;
+    const s = skill === null ? 0 : skill;
+    let d = base * (1 + s * a.range) * (1 - bossDeaths * a.deathEase);
+    d = Phaser.Math.Clamp(d, base * (1 - a.range) * 0.9, base * (1 + a.range));
+    return Math.round(d * 100) / 100;
+  },
+};
+
+
 // ===== src/player.js =====
 // 플레이어: 꼬마 로봇 "헌터"
 window.GH = window.GH || {};
@@ -660,7 +830,7 @@ GH.Player = class Player {
   }
 
   // 피격 결과: false(무적이라 무시) | 'blocked'(방패로 막음) | 'hit'(맞음)
-  takeDamage(amount, fromX, kind = 'touch') {
+  takeDamage(amount, fromX, kind = 'touch', source = 'unknown') {
     const scene = this.scene;
     const time = scene.time.now;
     if (this.isInvincible(time)) return false;
@@ -684,7 +854,8 @@ GH.Player = class Player {
     scene.cameras.main.shake(160, GH.CONFIG.shake.hurt);
     scene.cameras.main.flash(80, 255, 60, 100);
     GH.Sfx.hurt();
-    if (scene.onPlayerHurt) scene.onPlayerHurt(amount);
+    this.lastSource = source;
+    GH.Run.hit(amount, source);
 
     if (this.hp <= 0) {
       this.state = 'dead';
@@ -847,6 +1018,7 @@ GH.Enemy = class Enemy {
 GH.Charger = class Charger extends GH.Enemy {
   constructor(scene, x, y) {
     super(scene, x, y, 'charger', GH.CONFIG.enemies.charger, false);
+    this.name = 'charger';
     this.sprite.body.setSize(38, 32).setOffset(5, 8);
     this.setFacing(-1);
     this.setState('patrol', 0);
@@ -918,6 +1090,7 @@ GH.Charger = class Charger extends GH.Enemy {
 GH.Shooter = class Shooter extends GH.Enemy {
   constructor(scene, x, y) {
     super(scene, x, y, 'shooter', GH.CONFIG.enemies.shooter, true);
+    this.name = 'shooter';
     this.sprite.body.setSize(32, 24).setOffset(4, 8);
     this.baseY = y;
     this.nextShotAt = 0;
@@ -974,7 +1147,7 @@ GH.Shooter = class Shooter extends GH.Enemy {
     const s = this.sprite;
     const p = player.sprite;
     const angle = Phaser.Math.Angle.Between(s.x, s.y, p.x, p.y);
-    this.scene.spawnBullet(s.x, s.y + 6, Math.cos(angle) * this.cfg.bulletSpeed, Math.sin(angle) * this.cfg.bulletSpeed, this.cfg.bulletDamage);
+    this.scene.spawnBullet(s.x, s.y + 6, Math.cos(angle) * this.cfg.bulletSpeed, Math.sin(angle) * this.cfg.bulletSpeed, this.cfg.bulletDamage, 'shooter_bullet');
     GH.Sfx.shoot();
   }
 
@@ -992,6 +1165,10 @@ GH.Boss = class Boss extends GH.Enemy {
     const cfg = GH.CONFIG.boss;
     super(scene, x, y, 'boss', { hp: cfg.hp }, true);
     this.bcfg = cfg;
+    this.name = 'boss';
+    // 난이도 배율 d: 예고/쉬는 시간은 d로 나누고, 속도/HP/무력화 게이지는 d를 곱함
+    this.d = scene.difficulty || 1;
+    this.hp = this.maxHp = Math.round(cfg.hp * this.d);
     this.sprite.body.setSize(104, 86).setOffset(13, 16);
     this.sprite.setCollideWorldBounds(true);
     this.groundY = GH.CONFIG.world.groundY - 55;   // 바닥에 섰을 때의 중심 높이
@@ -1012,7 +1189,7 @@ GH.Boss = class Boss extends GH.Enemy {
   }
 
   // 2페이즈 배율 (예고/쉬는 시간이 짧아짐)
-  t(ms) { return this.phase === 2 ? ms * this.bcfg.phase2Speed : ms; }
+  t(ms) { return (this.phase === 2 ? ms * this.bcfg.phase2Speed : ms) / this.d; }
 
   // 보스는 맞아도 밀려나거나 경직되지 않음 (그로기 상태에서는 추가 피해)
   hit(damage, dir, knockback, finisher) {
@@ -1035,7 +1212,7 @@ GH.Boss = class Boss extends GH.Enemy {
     this.view.setScale(1.06, 0.95);
     scene.tweens.add({ targets: this.view, scaleX: 1, scaleY: 1, duration: 120 });
 
-    if (this.phase === 1 && this.hp <= this.bcfg.hp * this.bcfg.phase2At) {
+    if (this.phase === 1 && this.hp <= this.maxHp * this.bcfg.phase2At) {
       this.phase = 2;
       scene.banner('PHASE 2', 'CORE.EXE가 당신의 패턴을 학습했다', 1400);
     }
@@ -1060,7 +1237,7 @@ GH.Boss = class Boss extends GH.Enemy {
   // ===== 패턴 선택 =====
   nextPattern(time) {
     // HP 구간마다 무력화 필살기
-    const ratio = this.hp / this.bcfg.hp;
+    const ratio = this.hp / this.maxHp;
     const trig = this.bcfg.overload.triggers.find((r) => ratio <= r && !this.overloadDone.includes(r));
     if (trig !== undefined) {
       this.overloadDone.push(trig);
@@ -1107,7 +1284,7 @@ GH.Boss = class Boss extends GH.Enemy {
         break;
       }
       case 'charge':
-        s.setVelocityX(this.facing * c.charge.speed * (this.phase === 2 ? 1.15 : 1));
+        s.setVelocityX(this.facing * c.charge.speed * this.d * (this.phase === 2 ? 1.15 : 1));
         if (Math.floor(time / 30) % 2) this.afterImage(GH.COLORS.danger);
         if (s.body.blocked.left || s.body.blocked.right || time >= this.stateUntil) {
           s.setVelocityX(0);
@@ -1229,7 +1406,7 @@ GH.Boss = class Boss extends GH.Enemy {
         // 범위 안 + 땅 근처에 있으면 피해 (발판 위로 피하면 안전)
         const p = player.sprite;
         const nearGround = p.y > GH.CONFIG.world.groundY - 90;
-        if (Math.abs(p.x - this.slamX) <= c.radius && nearGround) player.takeDamage(c.damage, this.slamX, 'charge');
+        if (Math.abs(p.x - this.slamX) <= c.radius && nearGround) player.takeDamage(c.damage, this.slamX, 'charge', 'boss_slam');
         this.setState('slam_recover', scene.time.now, c.recover);
       },
     });
@@ -1255,7 +1432,8 @@ GH.Boss = class Boss extends GH.Enemy {
     const offset = (this.volleysLeft % 2) * (spread / (f.bullets - 1)) * 0.5;
     for (let i = 0; i < f.bullets; i++) {
       const a = base - spread / 2 + (spread * i) / (f.bullets - 1) + offset;
-      this.scene.spawnBullet(s.x, s.y, Math.cos(a) * f.speed, Math.sin(a) * f.speed, f.damage);
+      const sp = f.speed * this.d;
+      this.scene.spawnBullet(s.x, s.y, Math.cos(a) * sp, Math.sin(a) * sp, f.damage, 'boss_fan');
     }
     GH.Sfx.shoot();
   }
@@ -1271,7 +1449,8 @@ GH.Boss = class Boss extends GH.Enemy {
     scene.tweens.add({
       targets: this.sprite, x: GH.CONFIG.screen.width / 2, y: this.groundY - 120, duration: 600, ease: 'Sine.InOut',
       onComplete: () => {
-        this.ovGauge = o.gauge;
+        this.ovGauge = Math.round(o.gauge * this.d);
+        this.ovGaugeMax = this.ovGauge;
         this.ovStart = scene.time.now;
         this.view.setTint(GH.COLORS.neonYellow);
         this.setState('overload', scene.time.now, o.time);
@@ -1313,7 +1492,7 @@ GH.Boss = class Boss extends GH.Enemy {
       player.invincibleUntil = 0;
       if (player.state === 'guard') player.endGuard();
       if (player.state === 'dash') { player.sprite.body.setAllowGravity(true); player.dashHit = null; player.state = 'normal'; }
-      player.takeDamage(Math.round(GH.CONFIG.player.maxHp * o.failDamageRatio), this.sprite.x, 'blast');
+      player.takeDamage(Math.round(GH.CONFIG.player.maxHp * o.failDamageRatio), this.sprite.x, 'blast', 'boss_overload');
     }
     if (scene.onOverloadResult) scene.onOverloadResult(false);
     this.applyTint();
@@ -1334,7 +1513,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
   levelConfig() {
     return {
       width: GH.CONFIG.world.width,
-      name: 'SECTOR 1', title: 'SECTOR 1', sub: '버그 구역을 정화하라',
+      id: 'S1', name: 'SECTOR 1', title: 'SECTOR 1', sub: '버그 구역을 정화하라',
       platforms: [[470, 380], [700, 320], [1150, 370], [1400, 300], [1880, 375], [2130, 315]],
       playerX: 120, gate: true,
     };
@@ -1347,6 +1526,8 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
 
   create() {
     const L = this.levelConfig();
+    GH.Run.init();
+    this.difficulty = GH.Run.startAttempt(L.id);   // 시도 시작 기록 + 이번 시도의 난이도
     const W = L.width;
     const H = GH.CONFIG.screen.height;
     const groundY = GH.CONFIG.world.groundY;
@@ -1402,7 +1583,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
 
     // ---- 접촉 피해 ----
     this.physics.add.overlap(this.player.sprite, this.bullets, (ps, b) => {
-      if (this.player.takeDamage(b.damage, b.x, 'bullet')) this.popBullet(b);
+      if (this.player.takeDamage(b.damage, b.x, 'bullet', b.source || 'bullet')) this.popBullet(b);
     });
 
     // ---- 콤보 카운터 ----
@@ -1415,11 +1596,24 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       const m = GH.Sfx.toggleMute();
       this.toast(m ? '소리 꺼짐' : '소리 켜짐');
     });
+    // 디버그(?debug=1): L 키로 로그 파일 다운로드
+    this.input.keyboard.on('keydown-L', () => { if (GH.Run.debug) GH.Run.downloadLogs(); });
     this.input.keyboard.on('keydown-R', () => {
       if (this.player.state === 'dead' || this.cleared) this.scene.restart();
     });
 
     this.createHud(L.name);
+    if (L.id === 'S1') {
+      this.add.text(20, 522, '※ 게임 개선을 위해 익명 플레이 기록(클리어 시간, 피격 횟수 등)이 수집됩니다', {
+        fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', fontSize: '11px', color: '#ffffff',
+      }).setScrollFactor(0).setDepth(100).setAlpha(0.5);
+    }
+    if (GH.Run.debug) {
+      const sk = GH.Run.skill === null ? '-' : GH.Run.skill;
+      this.add.text(480, 44, `[DEBUG] group=${GH.Run.group}  skill=${sk}  difficulty=x${this.difficulty}  attempt=${GH.Run.attempts[L.id]}  (L: 로그 다운로드)`, {
+        fontFamily: 'monospace', fontSize: '12px', color: '#ffe14f', backgroundColor: '#000000aa',
+      }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(300);
+    }
     this.banner(L.title, L.sub, 1600);
   }
 
@@ -1477,7 +1671,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
         const dmg = e.contactDamage();
         if (dmg > 0 && Phaser.Geom.Intersects.RectangleToRectangle(this.player.sprite.getBounds(), e.sprite.getBounds())) {
           const kind = e.state === 'charge' ? 'charge' : 'touch';
-          const r = this.player.takeDamage(dmg, e.sprite.x, kind);
+          const r = this.player.takeDamage(dmg, e.sprite.x, kind, `${e.name}_${kind}`);
           if (r === 'blocked') {
             // 방패에 막힌 적은 튕겨 나가며 경직
             e.hit(0, this.player.facing, kind === 'charge' ? 420 : 240, false);
@@ -1525,6 +1719,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     // 게이트 진입
     if (this.gateOpen && !this.cleared && Math.abs(this.player.sprite.x - this.gate.x) < 40) {
       this.cleared = true;
+      GH.Run.endAttempt('clear', { hp_left: this.player.hp });
       this.cameras.main.fadeOut(400, 0, 0, 0);
       this.time.delayedCall(450, () => this.scene.start('Boss'));
     }
@@ -1599,15 +1794,17 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
   }
 
   onPlayerDead() {
+    GH.Run.endAttempt('death', { hp_left: 0 });
     this.time.delayedCall(600, () => this.banner('SYSTEM DOWN', 'R 키를 눌러 다시 시작', 0));
   }
 
   // ===== 탄 =====
-  spawnBullet(x, y, vx, vy, damage) {
+  spawnBullet(x, y, vx, vy, damage, source) {
     const b = this.bullets.create(x, y, 'bullet').setDepth(8);
     b.body.setCircle(6, 2, 2);
     b.setVelocity(vx, vy);
     b.damage = damage;
+    b.source = source || 'bullet';
   }
 
   // ===== 에너지 파동 =====
@@ -1795,7 +1992,9 @@ GH.BossScene = class BossScene extends GH.SectorScene {
   levelConfig() {
     return {
       width: GH.CONFIG.screen.width,
-      name: 'BOSS SECTOR', title: 'WARNING', sub: '폭주 AI "CORE.EXE" 접근 중',
+      id: 'BOSS', name: 'BOSS SECTOR', title: 'WARNING',
+      // 두 그룹 모두 같은 문구 (A/B 테스트에서 화면 차이가 생기지 않도록)
+      sub: '폭주 AI "CORE.EXE"가 당신의 전투 데이터를 분석했다',
       platforms: [[150, 340], [810, 340]],   // 내려찍기를 피할 수 있는 양쪽 발판
       playerX: 140, gate: false,
     };
@@ -1832,12 +2031,14 @@ GH.BossScene = class BossScene extends GH.SectorScene {
 
   onOverloadResult(success) {
     this.overloadResults.push(success);
+    GH.Run.overloadResult(success);
   }
 
   onEnemyKilled(e) {
     this.kills += 1;
     if (this.boss.tele) this.boss.tele.destroy();
     this.cleared = true;
+    GH.Run.endAttempt('clear', { hp_left: this.player.hp });
     // 보스 처치 연출: 슬로모션 + 연쇄 폭발
     this.physics.world.timeScale = 3;
     for (let i = 0; i < 8; i++) {
@@ -1880,7 +2081,7 @@ GH.BossScene = class BossScene extends GH.SectorScene {
       const o = GH.CONFIG.boss.overload;
       const left = Math.max(0, b.stateUntil - time) / o.time;
       g.fillStyle(0x000000, 0.7).fillRect(330, 98, 300, 16);
-      g.fillStyle(GH.COLORS.neonYellow, 1).fillRect(330, 98, 300 * (b.ovGauge / o.gauge), 16);
+      g.fillStyle(GH.COLORS.neonYellow, 1).fillRect(330, 98, 300 * (b.ovGauge / (b.ovGaugeMax || o.gauge)), 16);
       g.fillStyle(GH.COLORS.danger, 1).fillRect(330, 118, 300 * left, 5);
       if (!this.ovLabel) {
         this.ovLabel = this.add.text(480, 84, '무력화 게이지', { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', fontSize: '13px', color: '#ffe14f' })
