@@ -32,14 +32,17 @@ GH.CONFIG = {
     jumpCut: 0.45,        // 점프 키를 일찍 떼면 상승 속도를 이 비율로 줄임 (짧은 점프)
     coyoteTime: 90,       // 발판에서 떨어진 직후에도 점프를 받아주는 시간(ms)
     jumpBuffer: 120,      // 착지 직전에 누른 점프를 기억하는 시간(ms)
-    // 3타 콤보: 데미지 / 지속시간(ms) / 판정 크기 / 적을 밀어내는 힘 / 앞으로 내딛는 힘
+    // 3타 콤보: 데미지 / 지속시간(ms) / 근접 판정 크기 / 밀어내는 힘 / 내딛는 힘 / 날아가는 파동의 속도와 사거리
     combo: [
-      { damage: 8,  duration: 170, range: 58, height: 40, knockback: 160, lunge: 140 },
-      { damage: 10, duration: 170, range: 62, height: 42, knockback: 200, lunge: 160 },
-      { damage: 18, duration: 260, range: 80, height: 56, knockback: 520, lunge: 320 },
+      { damage: 8,  duration: 170, range: 58, height: 40, knockback: 160, lunge: 140, waveSpeed: 560, waveDistance: 130 },
+      { damage: 10, duration: 170, range: 62, height: 42, knockback: 200, lunge: 160, waveSpeed: 560, waveDistance: 140 },
+      { damage: 18, duration: 260, range: 80, height: 56, knockback: 520, lunge: 320, waveSpeed: 700, waveDistance: 280 },
     ],
     comboWindow: 300,     // 다음 타 입력을 받아주는 시간(ms)
-    dash: { speed: 700, duration: 150, cooldown: 700 },
+    upSlash: { angle: 40, lift: 380 },  // ↑+Z 올려베기: 파동 각도(도), 첫 올려베기 시 떠오르는 힘(점프당 1회)
+    // 대시: 지나간 적에게 피해 + 경직, 대시 직후 짧은 무적(afterSafe)
+    // 대시로 친 적은 뒤쪽으로 튕기고 더 오래 경직(stun) → 로봇이 통과해 지나갈 수 있음
+    dash: { speed: 760, duration: 170, cooldown: 700, damage: 8, knockback: 140, stun: 450, afterSafe: 250 },
     // 원거리 사격 (C): 근접보다 약하게, 탄 수 제한
     shot: { damage: 5, speed: 640, knockback: 70, cooldown: 220, maxAmmo: 3, reload: 900 },
     // 방패 (↓ 누르고 있기): 정면 공격만 막음
@@ -184,6 +187,20 @@ GH.makeTextures = function (scene) {
   g.lineStyle(4, C.neonCyan, 1);
   g.strokeRoundedRect(2, 2, 66, 116, 12);
   g.generateTexture('gate', 70, 120);
+
+  // ---- 에너지 파동 (Z 공격 시 날아감) ----
+  g.clear();
+  g.fillStyle(C.neonCyan, 0.25);
+  g.fillEllipse(16, 40, 30, 76);
+  g.lineStyle(7, C.neonCyan, 1);
+  g.beginPath();
+  g.arc(4, 40, 32, Phaser.Math.DegToRad(-65), Phaser.Math.DegToRad(65), false);
+  g.strokePath();
+  g.lineStyle(3, 0xffffff, 1);
+  g.beginPath();
+  g.arc(4, 40, 32, Phaser.Math.DegToRad(-55), Phaser.Math.DegToRad(55), false);
+  g.strokePath();
+  g.generateTexture('wave', 40, 80);
 
   // ---- 방패 ----
   g.clear();
@@ -372,12 +389,12 @@ GH.Player = class Player {
     }
 
     const grounded = this.onGround;
-    if (grounded) this.lastGroundTime = time;
+    if (grounded) { this.lastGroundTime = time; this.liftUsed = false; }
     if (grounded && !this.wasOnGround) { this.squash(1.25, 0.75); GH.Sfx.land(); }
     this.wasOnGround = grounded;
 
     // 피격 무적 중 깜빡임
-    this.view.setAlpha(this.state !== 'dash' && time < this.invincibleUntil ? (Math.floor(time / 60) % 2 ? 0.35 : 1) : (this.state === 'dash' ? 0.6 : 1));
+    this.view.setAlpha(this.state !== 'dash' && time < (this.blinkUntil || 0) ? (Math.floor(time / 60) % 2 ? 0.35 : 1) : (this.state === 'dash' ? 0.6 : 1));
 
     if (this.state === 'hurt') return;
 
@@ -453,8 +470,14 @@ GH.Player = class Player {
     // 공격 판정을 플레이어에 붙여서 따라오게
     if (this.hitbox) {
       const r = this.hitbox.rect;
-      r.x = s.x + this.facing * (r.width / 2 + 8) - r.width / 2;
-      r.y = s.y - r.height / 2;
+      if (this.hitbox.up) {
+        // 올려베기: 앞쪽 위
+        r.x = s.x + this.facing * (r.width / 2) - r.width / 2;
+        r.y = s.y - r.height - 10;
+      } else {
+        r.x = s.x + this.facing * (r.width / 2 + 8) - r.width / 2;
+        r.y = s.y - r.height / 2;
+      }
       if (this.slashFx) this.slashFx.setPosition(s.x + this.facing * 34, s.y);
     }
   }
@@ -486,13 +509,29 @@ GH.Player = class Player {
     if (this.keys.left.isDown) this.setFacing(-1);
     if (this.keys.right.isDown) this.setFacing(1);
 
+    const up = this.keys.up.isDown;          // ↑를 누르고 있으면 올려베기
+    const inAir = !this.onGround;
+
     this.hitbox = {
-      rect: new Phaser.Geom.Rectangle(0, 0, atk.range, atk.height),
-      damage: atk.damage, knockback: atk.knockback, finisher: index === 2, hitTargets: new Set(),
+      rect: new Phaser.Geom.Rectangle(0, 0, atk.range, up ? atk.range : atk.height),
+      damage: atk.damage, knockback: atk.knockback, finisher: index === 2, hitTargets: new Set(), up,
     };
 
-    // 앞으로 내딛기
-    this.sprite.setVelocityX(this.facing * atk.lunge);
+    // 앞으로(또는 대각선 위로) 날아가는 에너지 파동 (근접 판정과 같은 대상은 한 번만 맞음)
+    const ang = up ? this.cfg.upSlash.angle : 0;
+    this.scene.spawnWave(this.sprite.x + this.facing * 24, this.sprite.y - (up ? 20 : 0), this.facing, atk, index === 2, this.hitbox.hitTargets, ang);
+
+    if (up && !this.liftUsed) {
+      // 첫 올려베기는 몸이 살짝 떠오름 (점프당 1회)
+      this.liftUsed = true;
+      this.sprite.setVelocityY(Math.min(this.sprite.body.velocity.y, -this.cfg.upSlash.lift));
+    } else if (inAir && this.sprite.body.velocity.y > 0) {
+      // 공중 공격 중에는 잠깐 체공
+      this.sprite.setVelocityY(0);
+    }
+
+    // 앞으로 내딛기 (공중에서는 약하게)
+    this.sprite.setVelocityX(this.facing * atk.lunge * (inAir ? 0.4 : 1));
     this.scene.time.delayedCall(90, () => { if (this.attackId === id) this.sprite.setVelocityX(0); });
 
     // 베기 이펙트
@@ -542,6 +581,8 @@ GH.Player = class Player {
 
     this.state = 'dash';
     this.dashReadyAt = time + d.cooldown;
+    // 대시 공격 판정: 지나가는 적에게 피해
+    this.dashHit = { damage: d.damage, knockback: d.knockback, finisher: false, hitTargets: new Set() };
     this.sprite.body.setAllowGravity(false);
     this.sprite.setVelocity(dir * d.speed, 0);
     GH.Sfx.dash();
@@ -558,10 +599,13 @@ GH.Player = class Player {
     const id = this.dashId = (this.dashId || 0) + 1;
     this.scene.time.delayedCall(d.duration, () => {
       trail.remove();
+      this.dashHit = null;
       if (this.dashId !== id || this.state !== 'dash') return;
       this.sprite.body.setAllowGravity(true);
       this.sprite.setVelocityX(0);
       this.state = 'normal';
+      // 적을 통과한 직후 몸통에 바로 부딪혀 맞지 않도록 잠깐 무적
+      this.invincibleUntil = Math.max(this.invincibleUntil, this.scene.time.now + d.afterSafe);
     });
   }
 
@@ -581,6 +625,7 @@ GH.Player = class Player {
     this.endGuard();
     this.hp = Math.max(0, this.hp - amount);
     this.invincibleUntil = time + this.cfg.hurtInvincible;
+    this.blinkUntil = this.invincibleUntil;
     const dir = this.sprite.x < fromX ? -1 : 1;
     this.sprite.body.setAllowGravity(true);
     this.sprite.setVelocity(dir * 260, -320);
@@ -689,7 +734,7 @@ GH.Enemy = class Enemy {
   }
 
   // 플레이어 공격에 맞음
-  hit(damage, dir, knockback, finisher) {
+  hit(damage, dir, knockback, finisher, extraStun = 0) {
     if (!this.alive) return false;
     const scene = this.scene;
     const time = scene.time.now;
@@ -702,7 +747,7 @@ GH.Enemy = class Enemy {
     // 실제로 밀려남 + 경직 (예고/돌진이 끊김)
     this.sprite.setVelocityX(dir * knockback);
     if (finisher && this.sprite.body.allowGravity) this.sprite.setVelocityY(-220);
-    this.setState('stun', time, GH.CONFIG.enemies.hitStun + (finisher ? 150 : 0));
+    this.setState('stun', time, GH.CONFIG.enemies.hitStun + (finisher ? 150 : 0) + extraStun);
 
     // 찌그러짐
     scene.tweens.killTweensOf(this.view);
@@ -898,6 +943,10 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     const H = GH.CONFIG.screen.height;
     const groundY = GH.CONFIG.world.groundY;
     if (!this.textures.exists('robot')) GH.makeTextures(this);
+    // 재시작 시 이전 판의 상태 초기화
+    this.waves = [];
+    this.cleared = false;
+    this.bannerGroup = null;
 
     this.physics.world.setBounds(0, 0, W, H);
     this.cameras.main.setBounds(0, 0, W, H);
@@ -1029,6 +1078,25 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       }
     });
 
+    // 에너지 파동 이동과 명중
+    this.updateWaves();
+
+    // 대시 공격: 대시로 지나간 적
+    const dh = this.player.dashHit;
+    if (dh) {
+      const pr = this.player.sprite.getBounds();
+      Phaser.Geom.Rectangle.Inflate(pr, 10, 4);
+      this.enemies.forEach((e) => {
+        if (!e.alive || dh.hitTargets.has(e)) return;
+        if (Phaser.Geom.Intersects.RectangleToRectangle(pr, e.sprite.getBounds())) {
+          dh.hitTargets.add(e);
+          // 대시 방향의 반대쪽(로봇 뒤)으로 튕겨서 통과하는 느낌
+          this.onHitEnemy(e, { ...dh, dir: -this.player.facing, extraStun: GH.CONFIG.player.dash.stun });
+          this.popText(e.sprite.x, e.sprite.y - 62, 'DASH!', '#35f2ff', 16);
+        }
+      });
+    }
+
     // 플레이어 탄 명중
     this.pbullets.getChildren().slice().forEach((b) => {
       const hitEnemy = this.enemies.find((e) => e.alive && Phaser.Geom.Intersects.RectangleToRectangle(b.getBounds(), e.sprite.getBounds()));
@@ -1082,7 +1150,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
 
   onHitEnemy(e, hb) {
     const dir = hb.dir || this.player.facing;
-    const killed = e.hit(hb.damage, dir, hb.knockback, hb.finisher);
+    const killed = e.hit(hb.damage, dir, hb.knockback, hb.finisher, hb.extraStun || 0);
 
     const stop = killed ? GH.CONFIG.hitstop.kill : hb.finisher ? GH.CONFIG.hitstop.finisher : hb.light ? 25 : GH.CONFIG.hitstop.normal;
     this.hitstop(stop);
@@ -1129,6 +1197,62 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     b.body.setCircle(6, 2, 2);
     b.setVelocity(vx, vy);
     b.damage = damage;
+  }
+
+  // ===== 에너지 파동 =====
+  spawnWave(x, y, dir, atk, big, hitTargets, angleDeg = 0) {
+    const img = this.add.image(x, y, 'wave').setDepth(12).setFlipX(dir < 0);
+    const rad = Phaser.Math.DegToRad(angleDeg);
+    img.setAngle(-angleDeg * dir);
+    img.setScale(big ? 1.5 : 0.9, big ? 1.4 : 0.85);
+    if (big) img.setTint(GH.COLORS.neonPink);
+    if (!this.waves) this.waves = [];
+    this.waves.push({
+      img, dir, big, hitTargets, cos: Math.cos(rad), sin: Math.sin(rad),
+      speed: atk.waveSpeed, maxDist: atk.waveDistance, traveled: 0,
+      damage: atk.damage, knockback: atk.knockback,
+    });
+  }
+
+  updateWaves() {
+    if (!this.waves) return;
+    const dt = this.game.loop.delta / 1000;
+    this.waves = this.waves.filter((w) => {
+      const step = w.speed * dt;
+      w.img.x += w.dir * step * w.cos;
+      w.img.y -= step * w.sin;
+      w.traveled += step;
+      const life = w.traveled / w.maxDist;
+      w.img.setAlpha(1 - life * 0.8);
+      // 잔상
+      if (Math.random() < 0.5) {
+        const tr = this.add.image(w.img.x, w.img.y, 'wave').setFlipX(w.dir < 0).setScale(w.img.scaleX, w.img.scaleY).setAngle(w.img.angle)
+          .setTint(w.big ? GH.COLORS.neonPink : GH.COLORS.neonCyan).setAlpha(0.3).setDepth(11);
+        this.tweens.add({ targets: tr, alpha: 0, duration: 120, onComplete: () => tr.destroy() });
+      }
+      const wr = w.img.getBounds();
+      this.enemies.forEach((e) => {
+        if (!e.alive || w.hitTargets.has(e)) return;
+        if (Phaser.Geom.Intersects.RectangleToRectangle(wr, e.sprite.getBounds())) {
+          w.hitTargets.add(e);
+          this.onHitEnemy(e, { damage: w.damage, knockback: w.knockback, finisher: w.big, dir: w.dir });
+        }
+      });
+      // 적 탄 지우기
+      this.bullets.getChildren().slice().forEach((b) => {
+        if (Phaser.Geom.Intersects.RectangleToRectangle(wr, b.getBounds())) {
+          GH.Sfx.parry();
+          this.burst(b.x, b.y, 8, GH.COLORS.neonYellow);
+          this.popText(b.x, b.y - 20, 'PARRY', '#ffe14f', 18);
+          b.destroy();
+        }
+      });
+      if (w.traveled >= w.maxDist) {
+        this.tweens.add({ targets: w.img, alpha: 0, scaleY: 0.2, duration: 80, onComplete: () => w.img.destroy() });
+        return false;
+      }
+      return true;
+    });
   }
 
   spawnPlayerBullet(x, y, vx, vy, damage) {
@@ -1216,7 +1340,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     const font = { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', color: '#ffffff' };
     this.add.text(20, 16, 'GLITCH HUNTER', { ...font, fontSize: '22px', fontStyle: 'bold', color: '#35f2ff' }).setScrollFactor(0).setDepth(100);
     this.add.text(20, 44, 'SECTOR 1', { ...font, fontSize: '14px', color: '#ff4fd8' }).setScrollFactor(0).setDepth(100);
-    this.add.text(940, 16, '← → 이동   ↑/Space 점프   Z 공격   C 사격   ↓ 방패   X 대시   M 소리', { ...font, fontSize: '13px' })
+    this.add.text(940, 16, '← → 이동   ↑/Space 점프   Z 공격   ↑+Z 올려베기   C 사격   ↓ 방패   X 대시   M 소리', { ...font, fontSize: '13px' })
       .setOrigin(1, 0).setScrollFactor(0).setDepth(100).setAlpha(0.8);
     this.add.text(20, 72, 'HP', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
     this.add.text(20, 92, 'DASH', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
