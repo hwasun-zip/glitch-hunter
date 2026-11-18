@@ -76,6 +76,25 @@ GH.CONFIG = {
     },
     hitStun: 220,           // 맞으면 행동이 끊기는 시간(ms)
   },
+
+  // ===== 보스: 폭주 AI "CORE.EXE" =====
+  boss: {
+    hp: 420,
+    touchDamage: 8,
+    idle: 900,                    // 패턴 사이 쉬는 시간(ms)
+    phase2At: 0.5,                // HP 50% 이하 → 2페이즈 (예고 시간 단축, 속도 증가)
+    phase2Speed: 0.8,             // 2페이즈 예고/쉬는 시간 배율
+    charge: { telegraph: 850, speed: 640, damage: 18, stagger: 900 },
+    slam:   { follow: 650, lock: 400, radius: 110, damage: 20, recover: 750 },
+    fan:    { telegraph: 750, bullets: 7, spread: 70, speed: 290, volleys: 2, gap: 450, damage: 8 },
+    // 무력화 필살기: 제한 시간 안에 게이지를 깎으면 그로기, 실패하면 최대 HP의 50% 피해
+    overload: {
+      triggers: [0.7, 0.35],      // HP가 이 비율 아래로 떨어질 때 발동
+      gauge: 120, time: 5000,
+      failDamageRatio: 0.5,
+      groggy: 3500, groggyDamageMul: 1.5,
+    },
+  },
 };
 
 // 사이버펑크 + 귀여움 팔레트
@@ -220,6 +239,32 @@ GH.makeTextures = function (scene) {
   g.fillRoundedRect(8, 2, 10, 4, 2);
   g.generateTexture('pbullet', 20, 8);
 
+  // ---- 보스: 폭주 AI "CORE.EXE" 130x110 ----
+  g.clear();
+  g.fillStyle(C.danger, 1);
+  g.fillTriangle(30, 24, 18, 0, 44, 20);       // 뿔
+  g.fillTriangle(100, 24, 112, 0, 86, 20);
+  g.fillStyle(0x4a1d8a, 1);
+  g.fillRect(2, 50, 16, 30);                   // 팔
+  g.fillRect(112, 50, 16, 30);
+  g.fillStyle(0x3a1670, 1);
+  g.fillRoundedRect(14, 18, 102, 80, 20);      // 몸
+  g.lineStyle(3, C.neonPink, 1);
+  g.strokeRoundedRect(14, 18, 102, 80, 20);
+  g.fillStyle(0x0d0b1f, 1);
+  g.fillRoundedRect(28, 32, 74, 42, 10);       // 얼굴 화면
+  g.fillStyle(C.neonPink, 1);
+  g.fillCircle(65, 53, 14);                    // 눈
+  g.fillStyle(0xffffff, 1);
+  g.fillCircle(69, 50, 5);
+  g.fillStyle(C.neonCyan, 1);                  // 글리치 줄
+  g.fillRect(32, 40, 18, 3);
+  g.fillRect(84, 64, 14, 3);
+  g.fillStyle(C.neonYellow, 1);
+  g.fillRect(36, 98, 16, 10);                  // 추진기
+  g.fillRect(78, 98, 16, 10);
+  g.generateTexture('boss', 130, 110);
+
   // ---- 파티클 / 잔상용 ----
   g.clear();
   g.fillStyle(0xffffff, 1);
@@ -309,6 +354,11 @@ GH.Sfx = {
   pew()      { this.tone(1400, 700, 0.07, 'square', 0.09); },
   block()    { this.tone(180, 120, 0.1, 'square', 0.22); this.noise(0.08, 'bandpass', 2500, 0.3); },
   guardBreak() { this.tone(300, 60, 0.35, 'sawtooth', 0.3); this.noise(0.3, 'lowpass', 1200, 0.5); },
+  bossWarn() { this.tone(220, 220, 0.25, 'sawtooth', 0.18); this.tone(220, 220, 0.25, 'sawtooth', 0.18, 0.3); },
+  slam()     { this.noise(0.4, 'lowpass', 400, 0.8); this.tone(120, 30, 0.4, 'sine', 0.5); },
+  overload() { this.tone(80, 600, 1.2, 'sawtooth', 0.15); },
+  blast()    { this.noise(0.8, 'lowpass', 900, 0.9); this.tone(200, 20, 0.8, 'sawtooth', 0.4); },
+  groggy()   { [880, 660, 440, 220].forEach((f, i) => this.tone(f, f * 0.9, 0.15, 'square', 0.15, i * 0.08)); },
   clear()    { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f, 0.18, 'square', 0.12, i * 0.1)); },
 };
 
@@ -653,6 +703,7 @@ GH.Player = class Player {
     const scene = this.scene;
     this.guardGauge -= gc.cost[kind] || gc.cost.touch;
     this.guardRegenAt = time + gc.regenDelay;
+    this.invincibleUntil = Math.max(this.invincibleUntil, time + 250);  // 같은 공격에 연속으로 깎이지 않도록
     this.sprite.setVelocityX(-this.facing * 120);   // 막을 때 살짝 밀림
 
     if (this.guardGauge <= 0) {
@@ -931,15 +982,372 @@ GH.Shooter = class Shooter extends GH.Enemy {
 };
 
 
+// ===== src/boss.js =====
+// 보스: 폭주 AI "CORE.EXE"
+// 패턴 4종 (모두 예고가 있음): 돌진 / 내려찍기 / 부채꼴 탄막 / 무력화 필살기(OVERLOAD)
+window.GH = window.GH || {};
+
+GH.Boss = class Boss extends GH.Enemy {
+  constructor(scene, x, y) {
+    const cfg = GH.CONFIG.boss;
+    super(scene, x, y, 'boss', { hp: cfg.hp }, true);
+    this.bcfg = cfg;
+    this.sprite.body.setSize(104, 86).setOffset(13, 16);
+    this.sprite.setCollideWorldBounds(true);
+    this.groundY = GH.CONFIG.world.groundY - 55;   // 바닥에 섰을 때의 중심 높이
+    this.phase = 1;
+    this.lastPattern = null;
+    this.overloadDone = [];
+    this.untargetable = true;
+    this.tele = scene.add.graphics().setDepth(3);   // 바닥 예고 표시
+    this.view.setDepth(7);
+
+    // 등장: 위에서 떨어짐
+    this.sprite.y = -80;
+    this.setState('intro', scene.time.now, 1400);
+    scene.tweens.add({
+      targets: this.sprite, y: this.groundY, duration: 700, delay: 500, ease: 'Bounce.Out',
+      onComplete: () => { scene.cameras.main.shake(250, 0.015); GH.Sfx.slam(); },
+    });
+  }
+
+  // 2페이즈 배율 (예고/쉬는 시간이 짧아짐)
+  t(ms) { return this.phase === 2 ? ms * this.bcfg.phase2Speed : ms; }
+
+  // 보스는 맞아도 밀려나거나 경직되지 않음 (그로기 상태에서는 추가 피해)
+  hit(damage, dir, knockback, finisher) {
+    if (!this.alive || this.untargetable) return false;
+    const scene = this.scene;
+    const time = scene.time.now;
+    let dmg = damage;
+    if (this.state === 'groggy') dmg = Math.round(damage * this.bcfg.overload.groggyDamageMul);
+    this.hp = Math.max(0, this.hp - dmg);
+    this.lastDamage = dmg;
+
+    if (this.state === 'overload') {
+      this.ovGauge = Math.max(0, this.ovGauge - damage);
+      if (this.ovGauge <= 0) this.startGroggy(time);
+    }
+
+    this.view.setTintFill(0xffffff);
+    scene.time.delayedCall(60, () => { if (this.alive) this.applyTint(); });
+    scene.tweens.killTweensOf(this.view);
+    this.view.setScale(1.06, 0.95);
+    scene.tweens.add({ targets: this.view, scaleX: 1, scaleY: 1, duration: 120 });
+
+    if (this.phase === 1 && this.hp <= this.bcfg.hp * this.bcfg.phase2At) {
+      this.phase = 2;
+      scene.banner('PHASE 2', 'CORE.EXE가 당신의 패턴을 학습했다', 1400);
+    }
+    if (this.hp <= 0) { this.die(dir); return true; }
+    return false;
+  }
+
+  applyTint() {
+    this.view.clearTint();
+    if (this.state === 'groggy') this.view.setTint(0x777799);
+    else if (this.phase === 2) this.view.setTint(0xffb0c8);
+  }
+
+  contactDamage() {
+    if (!this.alive || this.untargetable || this.state === 'groggy' || this.state === 'intro') return 0;
+    if (this.state === 'charge') return this.bcfg.charge.damage;
+    return this.bcfg.touchDamage;
+  }
+
+  drawHp() { /* 보스 HP는 화면 위 큰 바로 표시 (scene.updateHud) */ }
+
+  // ===== 패턴 선택 =====
+  nextPattern(time) {
+    // HP 구간마다 무력화 필살기
+    const ratio = this.hp / this.bcfg.hp;
+    const trig = this.bcfg.overload.triggers.find((r) => ratio <= r && !this.overloadDone.includes(r));
+    if (trig !== undefined) {
+      this.overloadDone.push(trig);
+      return this.startOverload(time);
+    }
+    const pool = ['charge', 'slam', 'fan'].filter((p) => p !== this.lastPattern);
+    const p = Phaser.Math.RND.pick(pool);
+    this.lastPattern = p;
+    if (p === 'charge') this.startChargeTelegraph(time);
+    if (p === 'slam') this.startSlam(time);
+    if (p === 'fan') this.startFanTelegraph(time);
+  }
+
+  update(time, player) {
+    if (!this.alive) return;
+    const s = this.sprite;
+    const p = player.sprite;
+    const c = this.bcfg;
+    s.setVelocityY(0);
+
+    switch (this.state) {
+      case 'intro':
+        if (time >= this.stateUntil) { this.untargetable = false; this.setState('idle', time, this.t(c.idle)); }
+        break;
+
+      case 'idle':
+        // 플레이어 쪽으로 천천히 이동
+        this.setFacing(p.x < s.x ? -1 : 1);
+        s.setVelocityX(Math.abs(p.x - s.x) > 160 ? this.facing * 70 : 0);
+        s.y = this.groundY + Math.sin(time / 250) * 3;
+        if (time >= this.stateUntil && player.state !== 'dead') { s.setVelocityX(0); this.nextPattern(time); }
+        break;
+
+      // ---- 1. 돌진 ----
+      case 'charge_tel': {
+        s.x += Math.sin(time / 15) * 1.5;
+        const blink = Math.floor(time / 90) % 2;
+        this.tele.clear();
+        this.tele.fillStyle(GH.COLORS.danger, blink ? 0.35 : 0.15);
+        const x0 = this.facing > 0 ? s.x : 0;
+        const x1 = this.facing > 0 ? GH.CONFIG.screen.width : s.x;
+        this.tele.fillRect(x0, this.groundY - 50, x1 - x0, 100);
+        if (time >= this.stateUntil) { this.tele.clear(); this.setState('charge', time, 3000); this.view.clearTint(); }
+        break;
+      }
+      case 'charge':
+        s.setVelocityX(this.facing * c.charge.speed * (this.phase === 2 ? 1.15 : 1));
+        if (Math.floor(time / 30) % 2) this.afterImage(GH.COLORS.danger);
+        if (s.body.blocked.left || s.body.blocked.right || time >= this.stateUntil) {
+          s.setVelocityX(0);
+          this.scene.cameras.main.shake(200, 0.012);
+          GH.Sfx.slam();
+          this.view.setAngle(this.facing * -10);
+          this.setState('stagger', time, c.charge.stagger);   // 벽에 부딪혀 빈틈
+        }
+        break;
+      case 'stagger':
+        if (time >= this.stateUntil) { this.view.setAngle(0); this.setState('idle', time, this.t(c.idle)); }
+        break;
+
+      // ---- 2. 내려찍기 ----
+      case 'slam_follow':
+        // 예고 원이 플레이어를 따라다님
+        this.slamX = Phaser.Math.Linear(this.slamX, p.x, 0.15);
+        this.drawSlamMarker(time, false);
+        if (time >= this.stateUntil) this.setState('slam_lock', time, this.t(c.slam.lock));
+        break;
+      case 'slam_lock':
+        this.drawSlamMarker(time, true);   // 위치 고정 + 빠른 깜빡임
+        if (time >= this.stateUntil) this.doSlam(time, player);
+        break;
+      case 'slam_recover':
+        if (time >= this.stateUntil) this.setState('idle', time, this.t(c.idle));
+        break;
+
+      // ---- 3. 부채꼴 탄막 ----
+      case 'fan_tel':
+        s.setVelocityX(0);
+        if (time >= this.stateUntil) {
+          this.fireFan(player);
+          this.volleysLeft -= 1;
+          if (this.volleysLeft > 0) this.setState('fan_tel', time, c.fan.gap);
+          else { this.view.clearTint(); this.applyTint(); this.setState('idle', time, this.t(c.idle)); }
+        }
+        break;
+
+      // ---- 4. 무력화 필살기 ----
+      case 'overload_move':
+        break;
+      case 'overload':
+        this.drawOverloadRings(time);
+        if (time >= this.stateUntil) this.overloadBlast(time, player);
+        break;
+      case 'groggy':
+        if (time >= this.stateUntil) {
+          this.view.setAngle(0);
+          this.applyTint();
+          this.setState('idle', time, this.t(c.idle));
+        }
+        break;
+    }
+  }
+
+  afterImage(color) {
+    const s = this.sprite;
+    const g = this.scene.add.image(s.x, s.y, 'boss').setFlipX(this.view.flipX).setTint(color).setAlpha(0.35).setDepth(6);
+    this.scene.tweens.add({ targets: g, alpha: 0, duration: 200, onComplete: () => g.destroy() });
+  }
+
+  // ===== 돌진 =====
+  startChargeTelegraph(time) {
+    const p = this.scene.player.sprite;
+    this.setFacing(p.x < this.sprite.x ? -1 : 1);
+    this.sprite.y = this.groundY;
+    this.view.setTint(GH.COLORS.danger);
+    this.scene.bossCallout('돌진!');
+    GH.Sfx.bossWarn();
+    this.setState('charge_tel', time, this.t(this.bcfg.charge.telegraph));
+  }
+
+  // ===== 내려찍기 =====
+  startSlam(time) {
+    const scene = this.scene;
+    this.untargetable = true;
+    this.setState('slam_up', time, 99999);
+    scene.bossCallout('내려찍기!');
+    GH.Sfx.bossWarn();
+    scene.tweens.add({
+      targets: this.sprite, y: -120, duration: 380, ease: 'Quad.In',
+      onComplete: () => {
+        this.slamX = scene.player.sprite.x;
+        this.setState('slam_follow', scene.time.now, this.t(this.bcfg.slam.follow));
+      },
+    });
+  }
+
+  drawSlamMarker(time, locked) {
+    const r = this.bcfg.slam.radius;
+    const gy = GH.CONFIG.world.groundY;
+    const blink = Math.floor(time / (locked ? 60 : 140)) % 2;
+    this.tele.clear();
+    this.tele.fillStyle(GH.COLORS.danger, blink ? 0.45 : 0.2);
+    this.tele.fillEllipse(this.slamX, gy, r * 2, 28);
+    this.tele.lineStyle(3, locked ? GH.COLORS.neonYellow : GH.COLORS.danger, 1);
+    this.tele.strokeEllipse(this.slamX, gy, r * 2, 28);
+    this.tele.lineStyle(2, GH.COLORS.danger, 0.5);
+    this.tele.lineBetween(this.slamX, 0, this.slamX, gy);
+  }
+
+  doSlam(time, player) {
+    const scene = this.scene;
+    const c = this.bcfg.slam;
+    this.setState('slam_falling', time, 99999);
+    this.sprite.x = this.slamX;
+    scene.tweens.add({
+      targets: this.sprite, y: this.groundY, duration: 160, ease: 'Quad.In',
+      onComplete: () => {
+        this.tele.clear();
+        this.untargetable = false;
+        scene.cameras.main.shake(300, 0.02);
+        GH.Sfx.slam();
+        // 충격파
+        const ring = scene.add.ellipse(this.slamX, GH.CONFIG.world.groundY, 20, 10).setStrokeStyle(5, GH.COLORS.neonPink).setDepth(15);
+        scene.tweens.add({ targets: ring, width: c.radius * 2.6, height: 40, alpha: 0, duration: 350, onComplete: () => ring.destroy() });
+        scene.burst(this.slamX, GH.CONFIG.world.groundY - 10, 30, GH.COLORS.danger);
+        // 범위 안 + 땅 근처에 있으면 피해 (발판 위로 피하면 안전)
+        const p = player.sprite;
+        const nearGround = p.y > GH.CONFIG.world.groundY - 90;
+        if (Math.abs(p.x - this.slamX) <= c.radius && nearGround) player.takeDamage(c.damage, this.slamX, 'charge');
+        this.setState('slam_recover', scene.time.now, c.recover);
+      },
+    });
+  }
+
+  // ===== 부채꼴 탄막 =====
+  startFanTelegraph(time) {
+    this.volleysLeft = this.bcfg.fan.volleys + (this.phase === 2 ? 1 : 0);
+    this.view.setTint(GH.COLORS.neonPink);
+    this.scene.bossCallout('탄막!');
+    GH.Sfx.bossWarn();
+    // 팔을 들고 빛나는 예고
+    this.scene.tweens.add({ targets: this.view, scaleY: 1.12, duration: 200, yoyo: true, repeat: 1 });
+    this.setState('fan_tel', time, this.t(this.bcfg.fan.telegraph));
+  }
+
+  fireFan(player) {
+    const f = this.bcfg.fan;
+    const s = this.sprite;
+    const base = Phaser.Math.Angle.Between(s.x, s.y, player.sprite.x, player.sprite.y);
+    const spread = Phaser.Math.DegToRad(f.spread);
+    // 짝수/홀수 볼리를 엇갈리게 해서 빈틈 위치가 바뀜
+    const offset = (this.volleysLeft % 2) * (spread / (f.bullets - 1)) * 0.5;
+    for (let i = 0; i < f.bullets; i++) {
+      const a = base - spread / 2 + (spread * i) / (f.bullets - 1) + offset;
+      this.scene.spawnBullet(s.x, s.y, Math.cos(a) * f.speed, Math.sin(a) * f.speed, f.damage);
+    }
+    GH.Sfx.shoot();
+  }
+
+  // ===== 무력화 필살기 =====
+  startOverload(time) {
+    const scene = this.scene;
+    const o = this.bcfg.overload;
+    this.tele.clear();
+    this.setState('overload_move', time, 99999);
+    scene.banner('OVERLOAD', '제한 시간 안에 무력화 게이지를 깎아라!', 1500);
+    GH.Sfx.overload();
+    scene.tweens.add({
+      targets: this.sprite, x: GH.CONFIG.screen.width / 2, y: this.groundY - 120, duration: 600, ease: 'Sine.InOut',
+      onComplete: () => {
+        this.ovGauge = o.gauge;
+        this.ovStart = scene.time.now;
+        this.view.setTint(GH.COLORS.neonYellow);
+        this.setState('overload', scene.time.now, o.time);
+      },
+    });
+  }
+
+  drawOverloadRings(time) {
+    if (Math.floor(time / 120) % 3 === 0 && !this.ringCooldown) {
+      this.ringCooldown = true;
+      const ring = this.scene.add.circle(this.sprite.x, this.sprite.y, 140).setStrokeStyle(3, GH.COLORS.neonYellow).setDepth(5);
+      this.scene.tweens.add({ targets: ring, radius: 20, alpha: 0, duration: 500, onComplete: () => ring.destroy() });
+      this.scene.time.delayedCall(140, () => { this.ringCooldown = false; });
+    }
+    this.sprite.x = GH.CONFIG.screen.width / 2 + Math.sin(time / 30) * 2;
+  }
+
+  startGroggy(time) {
+    const scene = this.scene;
+    this.setState('groggy', time, this.bcfg.overload.groggy);
+    scene.tweens.killTweensOf(this.sprite);
+    scene.tweens.add({ targets: this.sprite, y: this.groundY, duration: 300, ease: 'Bounce.Out' });
+    this.view.setAngle(-14);
+    this.view.setTint(0x777799);
+    GH.Sfx.groggy();
+    scene.cameras.main.shake(250, 0.015);
+    scene.banner('GROGGY!', '무력화 성공! 지금이 기회다 (받는 피해 1.5배)', 1500);
+    if (scene.onOverloadResult) scene.onOverloadResult(true);
+  }
+
+  overloadBlast(time, player) {
+    const scene = this.scene;
+    const o = this.bcfg.overload;
+    scene.cameras.main.flash(400, 255, 80, 160);
+    scene.cameras.main.shake(500, 0.03);
+    GH.Sfx.blast();
+    // 무력화 실패: 최대 HP의 50% 피해 (방패와 무적으로도 막을 수 없음)
+    if (player.state !== 'dead') {
+      player.invincibleUntil = 0;
+      if (player.state === 'guard') player.endGuard();
+      if (player.state === 'dash') { player.sprite.body.setAllowGravity(true); player.dashHit = null; player.state = 'normal'; }
+      player.takeDamage(Math.round(GH.CONFIG.player.maxHp * o.failDamageRatio), this.sprite.x, 'blast');
+    }
+    if (scene.onOverloadResult) scene.onOverloadResult(false);
+    this.applyTint();
+    scene.tweens.add({ targets: this.sprite, y: this.groundY, duration: 400, ease: 'Quad.In' });
+    this.setState('idle', time, this.t(this.bcfg.idle) + 600);
+  }
+};
+
+
 // ===== src/scenes/SectorScene.js =====
 // SECTOR 1: 잡몹 구간 - 전부 처치하면 출구 게이트가 열림
 window.GH = window.GH || {};
 
 GH.SectorScene = class SectorScene extends Phaser.Scene {
-  constructor() { super('Sector'); }
+  constructor(key) { super(key || 'Sector'); }
+
+  // 섹터 구성 (보스 섹터는 이 함수들을 덮어씀)
+  levelConfig() {
+    return {
+      width: GH.CONFIG.world.width,
+      name: 'SECTOR 1', title: 'SECTOR 1', sub: '버그 구역을 정화하라',
+      platforms: [[470, 380], [700, 320], [1150, 370], [1400, 300], [1880, 375], [2130, 315]],
+      playerX: 120, gate: true,
+    };
+  }
+
+  spawnEnemies(groundY) {
+    [800, 1350, 2000].forEach((x) => this.enemies.push(new GH.Charger(this, x, groundY - 25)));
+    [[1020, 300], [1700, 280], [2300, 260]].forEach(([x, y]) => this.enemies.push(new GH.Shooter(this, x, y)));
+  }
 
   create() {
-    const W = GH.CONFIG.world.width;
+    const L = this.levelConfig();
+    const W = L.width;
     const H = GH.CONFIG.screen.height;
     const groundY = GH.CONFIG.world.groundY;
     if (!this.textures.exists('robot')) GH.makeTextures(this);
@@ -947,6 +1355,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     this.waves = [];
     this.cleared = false;
     this.bannerGroup = null;
+    this.ovLabel = null;
 
     this.physics.world.setBounds(0, 0, W, H);
     this.cameras.main.setBounds(0, 0, W, H);
@@ -957,7 +1366,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     const ground = this.add.rectangle(W / 2, groundY + 35, W, 70, GH.COLORS.ground);
     this.physics.add.existing(ground, true);
     this.solids.add(ground);
-    [[470, 380], [700, 320], [1150, 370], [1400, 300], [1880, 375], [2130, 315]].forEach(([x, y]) => {
+    L.platforms.forEach(([x, y]) => {
       const plat = this.solids.create(x, y, 'platform');
       // 아래에서는 통과, 위에서는 밟을 수 있는 발판
       plat.body.checkCollision.down = false;
@@ -966,19 +1375,19 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     });
 
     // ---- 출구 게이트 (전멸 시 열림) ----
-    this.gate = this.add.image(W - 70, groundY - 60, 'gate').setDepth(4).setAlpha(0.35);
     this.gateOpen = false;
+    if (L.gate) this.gate = this.add.image(W - 70, groundY - 60, 'gate').setDepth(4).setAlpha(0.35);
+    this.startTime = this.time.now;
 
     // ---- 플레이어 ----
-    this.player = new GH.Player(this, 120, groundY - 60);
+    this.player = new GH.Player(this, L.playerX, groundY - 60);
     this.physics.add.collider(this.player.sprite, this.solids);
     this.cameras.main.startFollow(this.player.sprite, true, 0.12, 0.12);
     this.cameras.main.setFollowOffset(-80, 0);
 
     // ---- 적 배치 ----
     this.enemies = [];
-    [800, 1350, 2000].forEach((x) => this.enemies.push(new GH.Charger(this, x, groundY - 25)));
-    [[1020, 300], [1700, 280], [2300, 260]].forEach(([x, y]) => this.enemies.push(new GH.Shooter(this, x, y)));
+    this.spawnEnemies(groundY);
     this.enemies.forEach((e) => this.physics.add.collider(e.sprite, this.solids));
     this.totalEnemies = this.enemies.length;
     this.kills = 0;
@@ -1010,8 +1419,8 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       if (this.player.state === 'dead' || this.cleared) this.scene.restart();
     });
 
-    this.createHud();
-    this.banner('SECTOR 1', '버그 구역을 정화하라', 1600);
+    this.createHud(L.name);
+    this.banner(L.title, L.sub, 1600);
   }
 
   // ===== 배경 =====
@@ -1064,7 +1473,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       e.update(time, this.player);
       e.drawHp();
       // 몸통 접촉 피해
-      if (e.alive && this.player.state !== 'dead') {
+      if (e.alive && !e.untargetable && this.player.state !== 'dead') {
         const dmg = e.contactDamage();
         if (dmg > 0 && Phaser.Geom.Intersects.RectangleToRectangle(this.player.sprite.getBounds(), e.sprite.getBounds())) {
           const kind = e.state === 'charge' ? 'charge' : 'touch';
@@ -1087,7 +1496,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       const pr = this.player.sprite.getBounds();
       Phaser.Geom.Rectangle.Inflate(pr, 10, 4);
       this.enemies.forEach((e) => {
-        if (!e.alive || dh.hitTargets.has(e)) return;
+        if (!e.alive || e.untargetable || dh.hitTargets.has(e)) return;
         if (Phaser.Geom.Intersects.RectangleToRectangle(pr, e.sprite.getBounds())) {
           dh.hitTargets.add(e);
           // 대시 방향의 반대쪽(로봇 뒤)으로 튕겨서 통과하는 느낌
@@ -1099,7 +1508,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
 
     // 플레이어 탄 명중
     this.pbullets.getChildren().slice().forEach((b) => {
-      const hitEnemy = this.enemies.find((e) => e.alive && Phaser.Geom.Intersects.RectangleToRectangle(b.getBounds(), e.sprite.getBounds()));
+      const hitEnemy = this.enemies.find((e) => e.alive && !e.untargetable && Phaser.Geom.Intersects.RectangleToRectangle(b.getBounds(), e.sprite.getBounds()));
       if (hitEnemy) {
         this.onHitEnemy(hitEnemy, { damage: b.damage, knockback: GH.CONFIG.player.shot.knockback, finisher: false, dir: Math.sign(b.body.velocity.x) || 1, light: true });
         b.destroy();
@@ -1116,7 +1525,8 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     // 게이트 진입
     if (this.gateOpen && !this.cleared && Math.abs(this.player.sprite.x - this.gate.x) < 40) {
       this.cleared = true;
-      this.banner('NEXT: BOSS SECTOR', '보스 섹터는 다음 업데이트에서 열립니다 (R: 다시 하기)', 0);
+      this.cameras.main.fadeOut(400, 0, 0, 0);
+      this.time.delayedCall(450, () => this.scene.start('Boss'));
     }
 
     if (time - this.lastHitTime > 1500 && this.comboCount > 0) {
@@ -1131,7 +1541,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     const hb = this.player.hitbox;
     if (!hb) return;
     this.enemies.forEach((e) => {
-      if (!e.alive || hb.hitTargets.has(e)) return;
+      if (!e.alive || e.untargetable || hb.hitTargets.has(e)) return;
       if (Phaser.Geom.Intersects.RectangleToRectangle(hb.rect, e.sprite.getBounds())) {
         hb.hitTargets.add(e);
         this.onHitEnemy(e, hb);
@@ -1160,7 +1570,8 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
 
     const s = e.sprite;
     this.hitSpark(s.x - dir * 8, s.y, hb.finisher || killed);
-    this.popText(s.x, s.y - 40, String(hb.damage), hb.finisher ? '#ffe14f' : '#ffffff', hb.finisher ? 30 : 22);
+    const shown = e.lastDamage !== undefined ? e.lastDamage : hb.damage;
+    if (shown > 0) this.popText(s.x, s.y - 40, String(shown), hb.finisher ? '#ffe14f' : '#ffffff', hb.finisher ? 30 : 22);
 
     this.comboCount += 1;
     this.lastHitTime = this.time.now;
@@ -1232,7 +1643,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       }
       const wr = w.img.getBounds();
       this.enemies.forEach((e) => {
-        if (!e.alive || w.hitTargets.has(e)) return;
+        if (!e.alive || e.untargetable || w.hitTargets.has(e)) return;
         if (Phaser.Geom.Intersects.RectangleToRectangle(wr, e.sprite.getBounds())) {
           w.hitTargets.add(e);
           this.onHitEnemy(e, { damage: w.damage, knockback: w.knockback, finisher: w.big, dir: w.dir });
@@ -1336,10 +1747,10 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
   }
 
   // ===== HUD =====
-  createHud() {
+  createHud(name) {
     const font = { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', color: '#ffffff' };
     this.add.text(20, 16, 'GLITCH HUNTER', { ...font, fontSize: '22px', fontStyle: 'bold', color: '#35f2ff' }).setScrollFactor(0).setDepth(100);
-    this.add.text(20, 44, 'SECTOR 1', { ...font, fontSize: '14px', color: '#ff4fd8' }).setScrollFactor(0).setDepth(100);
+    this.add.text(20, 44, name, { ...font, fontSize: '14px', color: '#ff4fd8' }).setScrollFactor(0).setDepth(100);
     this.add.text(940, 16, '← → 이동   ↑/Space 점프   Z 공격   ↑+Z 올려베기   C 사격   ↓ 방패   X 대시   M 소리', { ...font, fontSize: '13px' })
       .setOrigin(1, 0).setScrollFactor(0).setDepth(100).setAlpha(0.8);
     this.add.text(20, 72, 'HP', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
@@ -1374,6 +1785,113 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
 };
 
 
+// ===== src/scenes/BossScene.js =====
+// BOSS SECTOR: 폭주 AI "CORE.EXE"와의 결전 (한 화면 아레나)
+window.GH = window.GH || {};
+
+GH.BossScene = class BossScene extends GH.SectorScene {
+  constructor() { super('Boss'); }
+
+  levelConfig() {
+    return {
+      width: GH.CONFIG.screen.width,
+      name: 'BOSS SECTOR', title: 'WARNING', sub: '폭주 AI "CORE.EXE" 접근 중',
+      platforms: [[150, 340], [810, 340]],   // 내려찍기를 피할 수 있는 양쪽 발판
+      playerX: 140, gate: false,
+    };
+  }
+
+  spawnEnemies(groundY) {
+    this.boss = new GH.Boss(this, GH.CONFIG.screen.width - 220, groundY - 55);
+    this.enemies.push(this.boss);
+  }
+
+  create() {
+    super.create();
+    this.physics.world.setBoundsCollision(true, true, false, true);  // 보스가 화면 위로 뛰어오를 수 있게
+    this.cameras.main.stopFollow();
+    this.cameras.main.fadeIn(400);
+    this.overloadResults = [];
+
+    const font = { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', color: '#ffffff' };
+    this.bossName = this.add.text(480, 474 + 30, 'CORE.EXE', { ...font, fontSize: '14px', fontStyle: 'bold', color: '#ff4fd8' })
+      .setOrigin(0.5).setScrollFactor(0).setDepth(100);
+    this.bossBar = this.add.graphics().setScrollFactor(0).setDepth(100);
+    this.calloutText = this.add.text(480, 150, '', {
+      ...font, fontSize: '26px', fontStyle: 'bold', color: '#ffe14f', stroke: '#ff3b6b', strokeThickness: 6,
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(150).setAlpha(0);
+  }
+
+  // 보스가 다음 패턴을 외침 (예고의 일부)
+  bossCallout(text) {
+    this.calloutText.setText(text).setAlpha(1).setScale(1.4);
+    this.tweens.killTweensOf(this.calloutText);
+    this.tweens.add({ targets: this.calloutText, scale: 1, duration: 180, ease: 'Back.Out' });
+    this.tweens.add({ targets: this.calloutText, alpha: 0, delay: 700, duration: 250 });
+  }
+
+  onOverloadResult(success) {
+    this.overloadResults.push(success);
+  }
+
+  onEnemyKilled(e) {
+    this.kills += 1;
+    if (this.boss.tele) this.boss.tele.destroy();
+    this.cleared = true;
+    // 보스 처치 연출: 슬로모션 + 연쇄 폭발
+    this.physics.world.timeScale = 3;
+    for (let i = 0; i < 8; i++) {
+      this.time.delayedCall(i * 120, () => {
+        this.burst(e.deathX + Phaser.Math.Between(-60, 60), e.deathY + Phaser.Math.Between(-50, 50), 20, Phaser.Math.RND.pick([GH.COLORS.neonPink, GH.COLORS.neonCyan, GH.COLORS.neonYellow]));
+        this.cameras.main.shake(120, 0.012);
+        GH.Sfx.kill();
+      });
+    }
+    this.time.delayedCall(1200, () => {
+      this.physics.world.timeScale = 1;
+      GH.Sfx.clear();
+      const sec = Math.round((this.time.now - this.startTime) / 1000);
+      const ov = this.overloadResults.map((r) => (r ? '성공' : '실패')).join(', ') || '없음';
+      this.banner('SYSTEM RESTORED', `CORE.EXE 정화 완료!  클리어 ${Math.floor(sec / 60)}분 ${sec % 60}초  |  무력화: ${ov}  |  R: 다시 하기`, 0);
+    });
+  }
+
+  update(time) {
+    super.update(time);
+    // R로 다시 시작하면 보스전부터
+  }
+
+  updateHud(time) {
+    super.updateHud(time);
+    this.enemyText.setText('');
+    const b = this.boss;
+    const g = this.bossBar;
+    g.clear();
+    // 보스 HP 바 (화면 아래)
+    const w = 600, x = 480 - w / 2, y = 518;
+    g.fillStyle(0x000000, 0.6).fillRect(x - 2, y - 2, w + 4, 14);
+    g.fillStyle(b.phase === 2 ? GH.COLORS.danger : GH.COLORS.neonPink, 1).fillRect(x, y, w * (Math.max(0, b.hp) / b.maxHp), 10);
+    // 무력화 표시 지점
+    GH.CONFIG.boss.overload.triggers.forEach((r) => {
+      g.fillStyle(GH.COLORS.neonYellow, 1).fillRect(x + w * r - 1, y - 4, 2, 18);
+    });
+    // 무력화 게이지 + 남은 시간
+    if (b.alive && b.state === 'overload') {
+      const o = GH.CONFIG.boss.overload;
+      const left = Math.max(0, b.stateUntil - time) / o.time;
+      g.fillStyle(0x000000, 0.7).fillRect(330, 98, 300, 16);
+      g.fillStyle(GH.COLORS.neonYellow, 1).fillRect(330, 98, 300 * (b.ovGauge / o.gauge), 16);
+      g.fillStyle(GH.COLORS.danger, 1).fillRect(330, 118, 300 * left, 5);
+      if (!this.ovLabel) {
+        this.ovLabel = this.add.text(480, 84, '무력화 게이지', { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', fontSize: '13px', color: '#ffe14f' })
+          .setOrigin(0.5).setScrollFactor(0).setDepth(100);
+      }
+      this.ovLabel.setVisible(true);
+    } else if (this.ovLabel) this.ovLabel.setVisible(false);
+  }
+};
+
+
 // ===== src/main.js =====
 // 게임 시작점
 window.addEventListener('load', () => {
@@ -1389,7 +1907,7 @@ window.addEventListener('load', () => {
       arcade: { gravity: { y: GH.CONFIG.gravity }, debug: false },
     },
     scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
-    scene: [GH.SectorScene],
+    scene: [GH.SectorScene, GH.BossScene],
   });
 });
 
