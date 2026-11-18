@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v0.5',
+  version: 'v0.6',
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -124,6 +124,7 @@ GH.CONFIG = {
     overload: {
       triggers: [0.7, 0.35],      // HP가 이 비율 아래로 떨어질 때 발동
       gauge: 120, time: 5000,
+      hoverHeight: 70,            // v0.6: 120 → 70. 땅에서 휘두르면 안 닿고, 점프 공격과 올려베기는 닿는 높이
       failDamageRatio: 0.5,
       groggy: 3500, groggyDamageMul: 1.5,
     },
@@ -518,8 +519,9 @@ GH.Run = {
     c.lastSource = source;
   },
 
-  overloadResult(success) {
-    if (this.current) this.current.overload.push(success ? 1 : 0);
+  // 무력화 결과: 성공은 "O", 실패는 "X" + 남은 게이지 % (예: X42 = 42% 남기고 실패)
+  overloadResult(success, leftRatio = 0) {
+    if (this.current) this.current.overload.push(success ? 'O' : 'X' + Math.round(leftRatio * 100));
   },
 
   endAttempt(result, extra = {}, beacon = false) {
@@ -531,7 +533,7 @@ GH.Run = {
     const row = {
       sector: c.sector, attempt: c.attempt, result, duration_s: duration,
       hits_taken: c.hits, damage_taken: c.damage, cause: result === 'death' ? c.lastSource : '',
-      overload: c.overload.join(''), pattern_hits: c.patternHits, difficulty: c.difficulty,
+      overload: c.overload.join(','), pattern_hits: c.patternHits, difficulty: c.difficulty,
       ...extra,
     };
     if ((c.sector === 'S1' || c.sector === 'S2') && result === 'clear') {
@@ -555,7 +557,8 @@ GH.Run = {
     const total = Math.round((Date.now() - r.t0) / 1000);
     const rank = GH.Adaptive.rank(r.deaths, r.damage);
     const summary = { total_s: total, deaths: r.deaths, damage: r.damage, rank, overload };
-    this.log('run_complete', { sector: 'RUN', result: 'clear', duration_s: total, hits_taken: '', damage_taken: r.damage, overload, skill_score: this.skill, rank, run_deaths: r.deaths });
+    // 시트의 기존 열에 맞추기 위해 랭크와 쓰러진 횟수는 상세(JSON) 열에 함께 기록
+    this.log('run_complete', { sector: 'RUN', result: 'clear', duration_s: total, damage_taken: r.damage, overload, skill_score: this.skill, pattern_hits: { rank, run_deaths: r.deaths } });
     this.run = null;
     this.skills = {};
     this.skill = null;
@@ -1567,6 +1570,8 @@ GH.Boss = class Boss extends GH.Enemy {
 
   contactDamage() {
     if (!this.alive || this.untargetable || this.state === 'groggy' || this.state === 'intro') return 0;
+    // 무력화 중에는 몸에 닿아도 피해 없음 (점프해서 때리러 오는 플레이어를 벌주지 않도록)
+    if (this.state === 'overload' || this.state === 'overload_move') return 0;
     if (this.state === 'charge') return this.bcfg.charge.damage;
     return this.bcfg.touchDamage;
   }
@@ -1575,6 +1580,7 @@ GH.Boss = class Boss extends GH.Enemy {
 
   // ===== 패턴 선택 =====
   nextPattern(time) {
+    this.view.setAngle(0);   // 이전 패턴의 기울어짐 초기화
     // HP 구간마다 무력화 필살기
     const ratio = this.hp / this.maxHp;
     const trig = this.bcfg.overload.triggers.find((r) => ratio <= r && !this.overloadDone.includes(r));
@@ -1782,11 +1788,12 @@ GH.Boss = class Boss extends GH.Enemy {
     const scene = this.scene;
     const o = this.bcfg.overload;
     this.tele.clear();
+    this.view.setAngle(0);
     this.setState('overload_move', time, 99999);
     scene.banner('OVERLOAD', '제한 시간 안에 무력화 게이지를 깎아라!', 1500);
     GH.Sfx.overload();
     scene.tweens.add({
-      targets: this.sprite, x: GH.CONFIG.screen.width / 2, y: this.groundY - 120, duration: 600, ease: 'Sine.InOut',
+      targets: this.sprite, x: GH.CONFIG.screen.width / 2, y: this.groundY - o.hoverHeight, duration: 600, ease: 'Sine.InOut',
       onComplete: () => {
         this.ovGauge = Math.round(o.gauge * this.d);
         this.ovGaugeMax = this.ovGauge;
@@ -1817,7 +1824,7 @@ GH.Boss = class Boss extends GH.Enemy {
     GH.Sfx.groggy();
     scene.cameras.main.shake(250, 0.015);
     scene.banner('GROGGY!', '무력화 성공! 지금이 기회다 (받는 피해 1.5배)', 1500);
-    if (scene.onOverloadResult) scene.onOverloadResult(true);
+    if (scene.onOverloadResult) scene.onOverloadResult(true, 0);
   }
 
   overloadBlast(time, player) {
@@ -1833,7 +1840,9 @@ GH.Boss = class Boss extends GH.Enemy {
       if (player.state === 'dash') { player.sprite.body.setAllowGravity(true); player.dashHit = null; player.state = 'normal'; }
       player.takeDamage(Math.round(GH.CONFIG.player.maxHp * o.failDamageRatio), this.sprite.x, 'blast', 'boss_overload');
     }
-    if (scene.onOverloadResult) scene.onOverloadResult(false);
+    // 실패 시 게이지가 얼마나 남았는지 기록 (방법을 몰랐는지, 아슬아슬했는지 구분)
+    const left = this.ovGaugeMax ? this.ovGauge / this.ovGaugeMax : 1;
+    if (scene.onOverloadResult) scene.onOverloadResult(false, left);
     this.applyTint();
     scene.tweens.add({ targets: this.sprite, y: this.groundY, duration: 400, ease: 'Quad.In' });
     this.setState('idle', time, this.t(this.bcfg.idle) + 600);
@@ -1880,6 +1889,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     this.cleared = false;
     this.bannerGroup = null;
     this.ovLabel = null;
+    this.ovHint = null;
     this.victory = false;
 
     this.physics.world.setBounds(0, 0, W, H);
@@ -1950,6 +1960,9 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     });
 
     this.createHud(L.name);
+    // 버전 표시 (어떤 버전으로 플레이 중인지 항상 확인 가능)
+    this.add.text(950, 532, GH.CONFIG.version, { fontFamily: 'monospace', fontSize: '11px', color: '#ffffff' })
+      .setOrigin(1, 1).setScrollFactor(0).setDepth(300).setAlpha(0.45);
     if (L.id === 'S1') {
       this.add.text(20, 522, '※ 게임 개선을 위해 익명 플레이 기록(클리어 시간, 피격 횟수 등)이 수집됩니다', {
         fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', fontSize: '11px', color: '#ffffff',
@@ -1957,7 +1970,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     }
     if (GH.Run.debug) {
       const sk = GH.Run.skill === null ? '-' : GH.Run.skill;
-      this.add.text(20, 150, `[DEBUG] group=${GH.Run.group}  skill=${sk}  difficulty=x${this.difficulty}  attempt=${GH.Run.attempts[L.id]}  (L: 로그 다운로드)`, {
+      this.add.text(20, 488, `[DEBUG] group=${GH.Run.group}  skill=${sk}  difficulty=x${this.difficulty}  attempt=${GH.Run.attempts[L.id]}  (L: 로그 다운로드)`, {
         fontFamily: 'monospace', fontSize: '12px', color: '#ffe14f', backgroundColor: '#000000aa',
       }).setScrollFactor(0).setDepth(300);
     }
@@ -2448,9 +2461,9 @@ GH.BossScene = class BossScene extends GH.SectorScene {
     this.tweens.add({ targets: this.calloutText, alpha: 0, delay: 700, duration: 250 });
   }
 
-  onOverloadResult(success) {
+  onOverloadResult(success, leftRatio) {
     this.overloadResults.push(success);
-    GH.Run.overloadResult(success);
+    GH.Run.overloadResult(success, leftRatio);
   }
 
   onEnemyKilled(e) {
@@ -2550,7 +2563,18 @@ GH.BossScene = class BossScene extends GH.SectorScene {
           .setOrigin(0.5).setScrollFactor(0).setDepth(100);
       }
       this.ovLabel.setVisible(true);
-    } else if (this.ovLabel) this.ovLabel.setVisible(false);
+      // 안내: 떠 있는 보스를 공격하는 방법
+      if (!this.ovHint) {
+        this.ovHint = this.add.text(480, 136, '점프 공격이나 ↑+Z 올려베기로 코어를 노려라!', {
+          fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', fontSize: '15px', fontStyle: 'bold',
+          color: '#ffffff', backgroundColor: '#000000aa', padding: { x: 8, y: 4 },
+        }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(100);
+      }
+      this.ovHint.setVisible(true).setAlpha(Math.floor(time / 400) % 2 ? 1 : 0.6);
+    } else {
+      if (this.ovLabel) this.ovLabel.setVisible(false);
+      if (this.ovHint) this.ovHint.setVisible(false);
+    }
   }
 };
 
