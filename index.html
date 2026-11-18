@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v0.8',
+  version: 'v0.9',
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -1566,6 +1566,8 @@ GH.Boss = class Boss extends GH.Enemy {
 
     if (this.phase === 1 && this.hp <= this.maxHp * this.bcfg.phase2At) {
       this.phase = 2;
+      // 2페이즈 전용 패턴은 시작하자마자 한 번씩 반드시 보여줌 (순서는 무작위)
+      this.phase2Queue = Phaser.Utils.Array.Shuffle(['sweep', 'mirror']);
       scene.banner('PHASE 2', 'CORE.EXE가 당신의 패턴을 학습했다', 1400);
     }
     if (this.hp <= 0) { this.die(dir); return true; }
@@ -1602,7 +1604,7 @@ GH.Boss = class Boss extends GH.Enemy {
     }
     const base = this.phase === 2 ? ['charge', 'slam', 'fan', 'sweep', 'mirror'] : ['charge', 'slam', 'fan'];
     const pool = base.filter((p) => p !== this.lastPattern);
-    const p = Phaser.Math.RND.pick(pool);
+    const p = (this.phase2Queue && this.phase2Queue.length) ? this.phase2Queue.shift() : Phaser.Math.RND.pick(pool);
     this.lastPattern = p;
     if (p === 'charge') this.startChargeTelegraph(time);
     if (p === 'slam') this.startSlam(time);
