@@ -40,6 +40,17 @@ GH.CONFIG = {
     ],
     comboWindow: 300,     // 다음 타 입력을 받아주는 시간(ms)
     dash: { speed: 700, duration: 150, cooldown: 700 },
+    // 원거리 사격 (C): 근접보다 약하게, 탄 수 제한
+    shot: { damage: 5, speed: 640, knockback: 70, cooldown: 220, maxAmmo: 3, reload: 900 },
+    // 방패 (↓ 누르고 있기): 정면 공격만 막음
+    guard: {
+      max: 100,
+      cost: { bullet: 25, charge: 45, touch: 15 },  // 막을 때 깎이는 게이지
+      regen: 35,            // 초당 회복량
+      regenDelay: 600,      // 마지막으로 막은 뒤 회복 시작까지(ms)
+      breakStun: 700,       // 게이지가 바닥나 방패가 깨지면 무방비 시간(ms)
+      breakLock: 2000,      // 깨진 뒤 다시 들 수 없는 시간(ms)
+    },
     hurtInvincible: 900,  // 피격 후 무적 시간(ms)
     hurtStun: 250,        // 피격 후 조작 불가 시간(ms)
   },
@@ -50,9 +61,9 @@ GH.CONFIG = {
   enemies: {
     // 돌진형: 플레이어를 발견하면 예고(!) 후 돌진
     charger: {
-      hp: 40, patrolSpeed: 60, detectRange: 340,
+      hp: 40, patrolSpeed: 60, detectRange: 300,   // 돌진 거리(속도 x 시간 = 약 370px)가 발견 거리보다 길어야 실제로 닿음
       windup: 550,          // 예고 시간(ms) - 플레이어가 반응할 수 있는 시간
-      chargeSpeed: 460, chargeTime: 600, recover: 800,
+      chargeSpeed: 460, chargeTime: 800, recover: 800,
       chargeDamage: 14, touchDamage: 6,
     },
     // 원거리형: 거리를 두고 예고 후 탄 발사 (탄은 공격으로 베어서 지울 수 있음)
@@ -174,6 +185,24 @@ GH.makeTextures = function (scene) {
   g.strokeRoundedRect(2, 2, 66, 116, 12);
   g.generateTexture('gate', 70, 120);
 
+  // ---- 방패 ----
+  g.clear();
+  g.fillStyle(C.neonCyan, 0.25);
+  g.fillRoundedRect(4, 0, 14, 64, 7);
+  g.lineStyle(3, C.neonCyan, 1);
+  g.strokeRoundedRect(4, 1, 14, 62, 7);
+  g.lineStyle(1, 0xffffff, 0.8);
+  for (let y = 10; y < 60; y += 12) g.lineBetween(8, y, 14, y + 4);
+  g.generateTexture('shield', 22, 64);
+
+  // ---- 플레이어 탄 ----
+  g.clear();
+  g.fillStyle(C.neonCyan, 1);
+  g.fillRoundedRect(0, 0, 20, 8, 4);
+  g.fillStyle(0xffffff, 1);
+  g.fillRoundedRect(8, 2, 10, 4, 2);
+  g.generateTexture('pbullet', 20, 8);
+
   // ---- 파티클 / 잔상용 ----
   g.clear();
   g.fillStyle(0xffffff, 1);
@@ -260,6 +289,9 @@ GH.Sfx = {
   warn()     { this.tone(600, 900, 0.12, 'triangle', 0.12); this.tone(600, 900, 0.12, 'triangle', 0.12, 0.15); },
   shoot()    { this.tone(1200, 400, 0.12, 'square', 0.1); },
   parry()    { this.tone(1500, 2400, 0.08, 'triangle', 0.18); },
+  pew()      { this.tone(1400, 700, 0.07, 'square', 0.09); },
+  block()    { this.tone(180, 120, 0.1, 'square', 0.22); this.noise(0.08, 'bandpass', 2500, 0.3); },
+  guardBreak() { this.tone(300, 60, 0.35, 'sawtooth', 0.3); this.noise(0.3, 'lowpass', 1200, 0.5); },
   clear()    { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f, 0.18, 'square', 0.12, i * 0.1)); },
 };
 
@@ -279,12 +311,13 @@ GH.Player = class Player {
     this.sprite.setVisible(false);  // 물리 판정용 (보이지 않음)
     // 보이는 그림은 따로: 찌그러짐 연출이 물리 판정 크기를 바꾸지 않도록 분리
     this.view = scene.add.image(x, y, 'robot').setDepth(10);
+    this.shieldView = scene.add.image(x, y, 'shield').setDepth(11).setVisible(false);
     scene.events.on('postupdate', this.sync, this);
     scene.events.once('shutdown', () => scene.events.off('postupdate', this.sync, this));
 
     this.hp = this.cfg.maxHp;
     this.facing = 1;              // 1 = 오른쪽, -1 = 왼쪽
-    this.state = 'normal';        // normal | attack | dash | hurt | dead
+    this.state = 'normal';        // normal | attack | dash | guard | hurt | dead
     this.comboIndex = -1;
     this.comboQueued = false;
     this.lastAttackEnd = 0;
@@ -293,15 +326,23 @@ GH.Player = class Player {
     this.lastGroundTime = 0;
     this.jumpPressedAt = -9999;
     this.hitbox = null;           // 현재 공격 판정 { rect, damage, knockback, finisher, hitTargets }
+    this.ammo = this.cfg.shot.maxAmmo;
+    this.nextShotAt = 0;
+    this.nextReloadAt = 0;
+    this.guardGauge = this.cfg.guard.max;
+    this.guardRegenAt = 0;
+    this.guardLockedUntil = 0;
+    this.lastTime = 0;
 
     const K = Phaser.Input.Keyboard.KeyCodes;
     this.keys = scene.input.keyboard.addKeys({
-      left: K.LEFT, right: K.RIGHT, up: K.UP, space: K.SPACE, attack: K.Z, dash: K.X,
+      left: K.LEFT, right: K.RIGHT, up: K.UP, down: K.DOWN, space: K.SPACE, attack: K.Z, dash: K.X, shoot: K.C,
     });
   }
 
   sync() {
     this.view.setPosition(this.sprite.x, this.sprite.y);
+    this.shieldView.setPosition(this.sprite.x + this.facing * 24, this.sprite.y).setFlipX(this.facing < 0);
   }
 
   get onGround() {
@@ -315,7 +356,20 @@ GH.Player = class Player {
   update(time) {
     const s = this.sprite;
     const k = this.keys;
-    if (this.state === 'dead') return;
+    if (this.state === 'dead') { this.shieldView.setVisible(false); return; }
+    const dt = Math.min(100, time - (this.lastTime || time)) / 1000;
+    this.lastTime = time;
+
+    // ---- 탄 재충전 / 방패 게이지 회복 ----
+    const sc = this.cfg.shot;
+    if (this.ammo < sc.maxAmmo && time >= this.nextReloadAt) {
+      this.ammo += 1;
+      this.nextReloadAt = time + sc.reload;
+    }
+    const gc = this.cfg.guard;
+    if (this.state !== 'guard' && time >= this.guardRegenAt && time >= this.guardLockedUntil) {
+      this.guardGauge = Math.min(gc.max, this.guardGauge + gc.regen * dt);
+    }
 
     const grounded = this.onGround;
     if (grounded) this.lastGroundTime = time;
@@ -327,9 +381,36 @@ GH.Player = class Player {
 
     if (this.state === 'hurt') return;
 
-    // ---- 대시 ----
+    // ---- 대시 (방패 중에도 가능) ----
     if (Phaser.Input.Keyboard.JustDown(k.dash) && time >= this.dashReadyAt && this.state !== 'dash') {
+      this.endGuard();
       this.startDash(time);
+    }
+
+    // ---- 방패: ↓를 누르고 있는 동안 ----
+    if (this.state === 'normal' && k.down.isDown && time >= this.guardLockedUntil && this.guardGauge > 0) {
+      this.state = 'guard';
+      this.shieldView.setVisible(true).setAlpha(1).setScale(1.3);
+      this.scene.tweens.add({ targets: this.shieldView, scale: 1, duration: 120, ease: 'Back.Out' });
+    }
+    if (this.state === 'guard') {
+      if (!k.down.isDown) { this.endGuard(); }
+      else {
+        if (k.left.isDown) this.setFacing(-1);
+        if (k.right.isDown) this.setFacing(1);
+        s.setVelocityX(0);
+        return;
+      }
+    }
+
+    // ---- 사격 ----
+    if (Phaser.Input.Keyboard.JustDown(k.shoot) && this.state === 'normal' && this.ammo > 0 && time >= this.nextShotAt) {
+      this.ammo -= 1;
+      this.nextShotAt = time + sc.cooldown;
+      if (this.nextReloadAt < time) this.nextReloadAt = time + sc.reload;
+      this.scene.spawnPlayerBullet(s.x + this.facing * 26, s.y - 2, this.facing * sc.speed, 0, sc.damage, false);
+      this.view.x -= this.facing * 3;   // 반동
+      GH.Sfx.pew();
     }
 
     // ---- 공격 ----
@@ -376,6 +457,11 @@ GH.Player = class Player {
       r.y = s.y - r.height / 2;
       if (this.slashFx) this.slashFx.setPosition(s.x + this.facing * 34, s.y);
     }
+  }
+
+  endGuard() {
+    if (this.state === 'guard') this.state = 'normal';
+    this.shieldView.setVisible(false);
   }
 
   setFacing(dir) {
@@ -479,13 +565,20 @@ GH.Player = class Player {
     });
   }
 
-  // 피격: 반환값 true = 실제로 맞음
-  takeDamage(amount, fromX) {
+  // 피격 결과: false(무적이라 무시) | 'blocked'(방패로 막음) | 'hit'(맞음)
+  takeDamage(amount, fromX, kind = 'touch') {
     const scene = this.scene;
     const time = scene.time.now;
     if (this.isInvincible(time)) return false;
 
+    // 방패: 바라보는 쪽에서 온 공격만 막음
+    if (this.state === 'guard') {
+      const from = Math.sign(fromX - this.sprite.x) || this.facing;
+      if (from === this.facing) return this.block(kind, time);
+    }
+
     this.cancelAttack();
+    this.endGuard();
     this.hp = Math.max(0, this.hp - amount);
     this.invincibleUntil = time + this.cfg.hurtInvincible;
     const dir = this.sprite.x < fromX ? -1 : 1;
@@ -507,7 +600,37 @@ GH.Player = class Player {
     }
     this.state = 'hurt';
     scene.time.delayedCall(this.cfg.hurtStun, () => { if (this.state === 'hurt') this.state = 'normal'; });
-    return true;
+    return 'hit';
+  }
+
+  block(kind, time) {
+    const gc = this.cfg.guard;
+    const scene = this.scene;
+    this.guardGauge -= gc.cost[kind] || gc.cost.touch;
+    this.guardRegenAt = time + gc.regenDelay;
+    this.sprite.setVelocityX(-this.facing * 120);   // 막을 때 살짝 밀림
+
+    if (this.guardGauge <= 0) {
+      // 방패 깨짐: 잠깐 무방비
+      this.guardGauge = 0;
+      this.guardLockedUntil = time + gc.breakLock;
+      this.endGuard();
+      this.state = 'hurt';
+      scene.time.delayedCall(gc.breakStun, () => { if (this.state === 'hurt') this.state = 'normal'; });
+      this.view.setTint(0x8888aa);
+      scene.time.delayedCall(gc.breakStun, () => { if (this.state !== 'dead') this.view.clearTint(); });
+      scene.cameras.main.shake(180, 0.012);
+      GH.Sfx.guardBreak();
+      scene.popText(this.sprite.x, this.sprite.y - 50, 'GUARD BREAK', '#ff3b6b', 20);
+      scene.burst(this.sprite.x + this.facing * 24, this.sprite.y, 18, GH.COLORS.neonCyan);
+      return 'blocked';
+    }
+    this.shieldView.setTintFill(0xffffff);
+    scene.time.delayedCall(70, () => this.shieldView.clearTint());
+    scene.cameras.main.shake(70, 0.004);
+    GH.Sfx.block();
+    scene.burst(this.sprite.x + this.facing * 26, this.sprite.y, 6, GH.COLORS.neonCyan);
+    return 'blocked';
   }
 
   dashCooldownRatio(time) {
@@ -815,9 +938,13 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     this.bullets = this.physics.add.group({ allowGravity: false });
     this.physics.add.collider(this.bullets, this.solids, (b) => this.popBullet(b));
 
+    // ---- 플레이어 탄 ----
+    this.pbullets = this.physics.add.group({ allowGravity: false });
+    this.physics.add.collider(this.pbullets, this.solids, (b) => this.popBullet(b));
+
     // ---- 접촉 피해 ----
     this.physics.add.overlap(this.player.sprite, this.bullets, (ps, b) => {
-      if (this.player.takeDamage(b.damage, b.x)) this.popBullet(b);
+      if (this.player.takeDamage(b.damage, b.x, 'bullet')) this.popBullet(b);
     });
 
     // ---- 콤보 카운터 ----
@@ -891,9 +1018,24 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       if (e.alive && this.player.state !== 'dead') {
         const dmg = e.contactDamage();
         if (dmg > 0 && Phaser.Geom.Intersects.RectangleToRectangle(this.player.sprite.getBounds(), e.sprite.getBounds())) {
-          this.player.takeDamage(dmg, e.sprite.x);
+          const kind = e.state === 'charge' ? 'charge' : 'touch';
+          const r = this.player.takeDamage(dmg, e.sprite.x, kind);
+          if (r === 'blocked') {
+            // 방패에 막힌 적은 튕겨 나가며 경직
+            e.hit(0, this.player.facing, kind === 'charge' ? 420 : 240, false);
+            this.popText(e.sprite.x, e.sprite.y - 40, 'GUARD', '#35f2ff', 18);
+          }
         }
       }
+    });
+
+    // 플레이어 탄 명중
+    this.pbullets.getChildren().slice().forEach((b) => {
+      const hitEnemy = this.enemies.find((e) => e.alive && Phaser.Geom.Intersects.RectangleToRectangle(b.getBounds(), e.sprite.getBounds()));
+      if (hitEnemy) {
+        this.onHitEnemy(hitEnemy, { damage: b.damage, knockback: GH.CONFIG.player.shot.knockback, finisher: false, dir: Math.sign(b.body.velocity.x) || 1, light: true });
+        b.destroy();
+      } else if (b.x < -50 || b.x > GH.CONFIG.world.width + 50) b.destroy();
     });
 
     // 화면 밖으로 나간 탄 정리
@@ -939,12 +1081,12 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
   }
 
   onHitEnemy(e, hb) {
-    const dir = this.player.facing;
+    const dir = hb.dir || this.player.facing;
     const killed = e.hit(hb.damage, dir, hb.knockback, hb.finisher);
 
-    const stop = killed ? GH.CONFIG.hitstop.kill : hb.finisher ? GH.CONFIG.hitstop.finisher : GH.CONFIG.hitstop.normal;
+    const stop = killed ? GH.CONFIG.hitstop.kill : hb.finisher ? GH.CONFIG.hitstop.finisher : hb.light ? 25 : GH.CONFIG.hitstop.normal;
     this.hitstop(stop);
-    const shake = killed ? GH.CONFIG.shake.kill : hb.finisher ? GH.CONFIG.shake.finisher : GH.CONFIG.shake.hit;
+    const shake = killed ? GH.CONFIG.shake.kill : hb.finisher ? GH.CONFIG.shake.finisher : hb.light ? 0.002 : GH.CONFIG.shake.hit;
     this.cameras.main.shake(killed || hb.finisher ? 140 : 80, shake);
     if (killed) GH.Sfx.kill(); else if (hb.finisher) GH.Sfx.finisher(); else GH.Sfx.hit();
 
@@ -987,6 +1129,17 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     b.body.setCircle(6, 2, 2);
     b.setVelocity(vx, vy);
     b.damage = damage;
+  }
+
+  spawnPlayerBullet(x, y, vx, vy, damage) {
+    const b = this.pbullets.create(x, y, 'pbullet').setDepth(9);
+    b.setFlipX(vx < 0);
+    b.body.setSize(18, 8);
+    b.setVelocity(vx, vy);
+    b.damage = damage;
+    // 총구 섬광
+    const m = this.add.circle(x, y, 8, GH.COLORS.neonCyan).setDepth(12);
+    this.tweens.add({ targets: m, scale: 0.2, alpha: 0, duration: 90, onComplete: () => m.destroy() });
   }
 
   popBullet(b) {
@@ -1063,10 +1216,12 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     const font = { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', color: '#ffffff' };
     this.add.text(20, 16, 'GLITCH HUNTER', { ...font, fontSize: '22px', fontStyle: 'bold', color: '#35f2ff' }).setScrollFactor(0).setDepth(100);
     this.add.text(20, 44, 'SECTOR 1', { ...font, fontSize: '14px', color: '#ff4fd8' }).setScrollFactor(0).setDepth(100);
-    this.add.text(940, 16, '← → 이동   ↑/Space 점프   Z 공격   X 대시   M 소리', { ...font, fontSize: '13px' })
+    this.add.text(940, 16, '← → 이동   ↑/Space 점프   Z 공격   C 사격   ↓ 방패   X 대시   M 소리', { ...font, fontSize: '13px' })
       .setOrigin(1, 0).setScrollFactor(0).setDepth(100).setAlpha(0.8);
     this.add.text(20, 72, 'HP', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
     this.add.text(20, 92, 'DASH', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
+    this.add.text(20, 110, 'GUARD', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
+    this.add.text(20, 128, 'SHOT', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
     this.enemyText = this.add.text(940, 40, '', { ...font, fontSize: '14px', color: '#ffe14f' }).setOrigin(1, 0).setScrollFactor(0).setDepth(100);
     this.comboText = this.add.text(940, 70, '', {
       ...font, fontSize: '28px', fontStyle: 'bold', color: '#ffe14f', stroke: '#ff4fd8', strokeThickness: 5,
@@ -1078,11 +1233,18 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     const p = this.player;
     const g = this.hud;
     g.clear();
-    g.fillStyle(0x000000, 0.5).fillRect(60, 74, 160, 10);
-    g.fillStyle(p.hp > 30 ? GH.COLORS.neonCyan : GH.COLORS.danger, 1).fillRect(60, 74, 160 * (p.hp / p.cfg.maxHp), 10);
+    g.fillStyle(0x000000, 0.5).fillRect(72, 74, 160, 10);
+    g.fillStyle(p.hp > 30 ? GH.COLORS.neonCyan : GH.COLORS.danger, 1).fillRect(72, 74, 160 * (p.hp / p.cfg.maxHp), 10);
     const r = p.dashCooldownRatio(time);
-    g.fillStyle(0x000000, 0.5).fillRect(60, 94, 80, 8);
-    g.fillStyle(r >= 1 ? GH.COLORS.neonYellow : GH.COLORS.neonPurple, 1).fillRect(60, 94, 80 * r, 8);
+    g.fillStyle(0x000000, 0.5).fillRect(72, 94, 80, 8);
+    g.fillStyle(r >= 1 ? GH.COLORS.neonYellow : GH.COLORS.neonPurple, 1).fillRect(72, 94, 80 * r, 8);
+    const gc = p.cfg.guard;
+    const locked = time < p.guardLockedUntil;
+    g.fillStyle(0x000000, 0.5).fillRect(72, 112, 80, 8);
+    g.fillStyle(locked ? GH.COLORS.danger : GH.COLORS.neonCyan, locked ? 0.5 : 1).fillRect(72, 112, 80 * (p.guardGauge / gc.max), 8);
+    for (let i = 0; i < p.cfg.shot.maxAmmo; i++) {
+      g.fillStyle(i < p.ammo ? GH.COLORS.neonCyan : 0x333355, 1).fillRoundedRect(72 + i * 22, 129, 16, 8, 3);
+    }
     this.enemyText.setText(`남은 버그 ${this.totalEnemies - this.kills} / ${this.totalEnemies}`);
   }
 };
