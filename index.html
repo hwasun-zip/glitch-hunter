@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v0.4',
+  version: 'v0.5',
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -92,8 +92,9 @@ GH.CONFIG = {
     // 방패형 "방화벽 가드": 정면 공격을 막음. 뒤나 위에서 쳐야 함 (대시로 통과해서 뒤로)
     guard: {
       hp: 50, walkSpeed: 70, turnDelay: 700,   // 플레이어가 뒤로 가면 돌아서기까지 걸리는 시간(ms)
-      bashRange: 110, windup: 500, bashSpeed: 380, bashTime: 220, recover: 650,
-      bashDamage: 12, touchDamage: 5,
+      // v0.5: 예고 500 → 650ms, 걸어오다 몸에 닿는 피해 5 → 0 (플레이 로그에서 사망 원인 1위)
+      bashRange: 110, windup: 650, bashSpeed: 380, bashTime: 220, recover: 650,
+      bashDamage: 12, touchDamage: 0,
     },
     hitStun: 220,           // 맞으면 행동이 끊기는 시간(ms)
   },
@@ -111,7 +112,7 @@ GH.CONFIG = {
 
   // ===== 보스: 폭주 AI "CORE.EXE" =====
   boss: {
-    hp: 420,
+    hp: 700,                      // v0.5: 420 → 700 (플레이 로그에서 보스전이 30초 미만, 무력화가 1번만 발생)
     touchDamage: 8,
     idle: 900,                    // 패턴 사이 쉬는 시간(ms)
     phase2At: 0.5,                // HP 50% 이하 → 2페이즈 (예고 시간 단축, 속도 증가)
