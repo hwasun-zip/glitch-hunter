@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v0.10',
+  version: 'v0.11',
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -123,7 +123,8 @@ GH.CONFIG = {
     // 2페이즈 전용: 레이저 스윕. 예고선이 낮으면 점프, 높으면 땅에서 버티기 (방패 불가)
     // 2페이즈 전용: 미러 클론. 양쪽 끝의 진짜(눈 깜빡)와 가짜(반투명 지직)가 동시에 돌진, 진짜만 피해
     mirror: { telegraph: 1200, speed: 520, damage: 18, stagger: 900 },
-    sweep:  { telegraph: 850, beam: 450, gap: 250, count: 3, damage: 15, lowY: 450, highY: 378, thickness: 26 },
+    // v0.11: 높이를 플레이어가 서 있는 곳 기준으로 조준(발판 위 안전지대 제거), 예고 0.85 → 1.1초, 첫 레이저는 +0.4초
+    sweep:  { telegraph: 1100, firstExtra: 400, beam: 450, gap: 250, count: 3, damage: 15, lowOffset: 20, highOffset: 92, thickness: 26 },
     // 무력화 필살기: 제한 시간 안에 게이지를 깎으면 그로기, 실패하면 최대 HP의 50% 피해
     overload: {
       triggers: [0.7, 0.35],      // HP가 이 비율 아래로 떨어질 때 발동
@@ -712,7 +713,7 @@ GH.Player = class Player {
     }
 
     const grounded = this.onGround;
-    if (grounded) { this.lastGroundTime = time; this.liftUsed = false; }
+    if (grounded) { this.lastGroundTime = time; this.liftUsed = false; this.standY = s.body.bottom; }
     if (grounded && !this.wasOnGround) { this.squash(1.25, 0.75); GH.Sfx.land(); }
     this.wasOnGround = grounded;
 
@@ -1760,7 +1761,7 @@ GH.Boss = class Boss extends GH.Enemy {
         }
         break;
       case 'sweep_gap':
-        if (time >= this.stateUntil) { this.setState('sweep_tel', time, this.t(c.sweep.telegraph)); GH.Sfx.laserWarn(); }
+        if (time >= this.stateUntil) { this.aimSweep(); this.setState('sweep_tel', time, this.t(c.sweep.telegraph)); GH.Sfx.laserWarn(); }
         break;
 
       // ---- 4. 무력화 필살기 ----
@@ -1989,8 +1990,16 @@ GH.Boss = class Boss extends GH.Enemy {
     this.setState('sweep_move', time, 99999);
     scene.tweens.add({
       targets: this.sprite, x: this.sweepX, y: this.groundY - 40, duration: 500, ease: 'Sine.InOut',
-      onComplete: () => this.setState('sweep_tel', scene.time.now, this.t(c.telegraph)),
+      onComplete: () => { this.aimSweep(); this.setState('sweep_tel', scene.time.now, this.t(c.telegraph) + c.firstExtra); },
     });
+  }
+
+  // 플레이어가 서 있는 곳(땅 또는 발판)을 기준으로 레이저 높이를 정함
+  aimSweep() {
+    const c = this.bcfg.sweep;
+    const pl = this.scene.player;
+    const surface = pl.standY || GH.CONFIG.world.groundY;
+    this.sweepY = this.sweepLow ? surface - c.lowOffset : surface - c.highOffset;
   }
 
   nextSweepLow() {
@@ -1999,7 +2008,7 @@ GH.Boss = class Boss extends GH.Enemy {
 
   drawSweep(time, on) {
     const c = this.bcfg.sweep;
-    const y = this.sweepLow ? c.lowY : c.highY;
+    const y = this.sweepY;
     const W = GH.CONFIG.screen.width;
     const g = this.tele;
     g.clear();
@@ -2015,7 +2024,12 @@ GH.Boss = class Boss extends GH.Enemy {
           color: '#ffe14f', stroke: '#000000', strokeThickness: 4,
         }).setOrigin(0.5).setDepth(20);
       }
-      this.sweepLabel.setText(this.sweepLow ? '▲ 점프!' : '▼ 땅에서 버텨!').setPosition(W / 2, y - 26).setVisible(true);
+      this.sweepLabel.setText(this.sweepLow ? '▲ 점프!' : '▼ 그대로 버텨!').setPosition(W / 2, y - 26).setVisible(true);
+      // 보스 눈에 붉은 빛이 모이는 충전 연출 (남은 시간에 따라 커짐)
+      const k = 1 - Math.max(0, this.stateUntil - time) / (this.t(c.telegraph) + c.firstExtra);
+      g.fillStyle(GH.COLORS.danger, 0.25 + k * 0.5).fillCircle(this.sprite.x, this.sprite.y - 2, 6 + k * 22);
+      g.fillStyle(0xffffff, 0.6 + k * 0.4).fillCircle(this.sprite.x, this.sprite.y - 2, 3 + k * 6);
+      g.lineStyle(2, GH.COLORS.danger, 0.5).lineBetween(this.sprite.x, this.sprite.y, this.sprite.x, y);
     } else {
       if (this.sweepLabel) this.sweepLabel.setVisible(false);
       g.fillStyle(GH.COLORS.danger, 0.45).fillRect(0, y - c.thickness / 2, W, c.thickness);
@@ -2025,7 +2039,7 @@ GH.Boss = class Boss extends GH.Enemy {
 
   checkSweepHit(player) {
     const c = this.bcfg.sweep;
-    const y = this.sweepLow ? c.lowY : c.highY;
+    const y = this.sweepY;
     const b = player.sprite.getBounds();
     if (b.bottom > y - c.thickness / 2 && b.top < y + c.thickness / 2) {
       player.takeDamage(c.damage, this.sprite.x, 'hazard', 'boss_sweep');
