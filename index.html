@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v0.9',
+  version: 'v0.10',
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -130,7 +130,8 @@ GH.CONFIG = {
       gauge: 120, time: 5000,
       hoverHeight: 70,            // v0.6: 120 → 70. 땅에서 휘두르면 안 닿고, 점프 공격과 올려베기는 닿는 높이
       failDamageRatio: 0.5,
-      groggy: 3500, groggyDamageMul: 1.5,
+      // v0.10: 1.5배 3.5초 → 1.25배 2.5초 (그로기 한 번 = 보스 HP의 약 18~23%, 페이즈를 건너뛰지 않으면서 평소 화력의 2.5배 이상)
+      groggy: 2500, groggyDamageMul: 1.25,
     },
   },
 };
@@ -1552,6 +1553,11 @@ GH.Boss = class Boss extends GH.Enemy {
     this.hp = Math.max(floor, this.hp - dmg);
     this.lastDamage = before - this.hp;
     if (floor > 0 && this.hp === floor) this.pendingOverload = next;
+    // HP가 무력화 지점에 멈춰 있는 동안의 공격은 보호막에 막힘을 표시
+    if (this.lastDamage === 0 && damage > 0 && time > (this.shieldMsgAt || 0)) {
+      this.shieldMsgAt = time + 700;
+      scene.popText(this.sprite.x, this.sprite.y - 70, 'SHIELD', '#35f2ff', 16);
+    }
 
     if (this.state === 'overload') {
       this.ovGauge = Math.max(0, this.ovGauge - damage);
@@ -1568,6 +1574,7 @@ GH.Boss = class Boss extends GH.Enemy {
       this.phase = 2;
       // 2페이즈 전용 패턴은 시작하자마자 한 번씩 반드시 보여줌 (순서는 무작위)
       this.phase2Queue = Phaser.Utils.Array.Shuffle(['sweep', 'mirror']);
+      this.phase2Left = 2;   // 두 패턴을 다 보여주기 전에는 두 번째 무력화를 미룸
       scene.banner('PHASE 2', 'CORE.EXE가 당신의 패턴을 학습했다', 1400);
     }
     if (this.hp <= 0) { this.die(dir); return true; }
@@ -1622,7 +1629,8 @@ GH.Boss = class Boss extends GH.Enemy {
 
     // 예약된 무력화: 끊어도 되는 상태라면 바로 시작
     const interruptible = ['idle', 'stagger', 'slam_recover', 'charge_tel', 'fan_tel', 'sweep_tel', 'mirror_tel'];
-    if (this.pendingOverload !== undefined && interruptible.includes(this.state)) {
+    const holdForPhase2 = this.phase === 2 && this.phase2Left > 0;
+    if (this.pendingOverload !== undefined && !holdForPhase2 && interruptible.includes(this.state)) {
       this.overloadDone.push(this.pendingOverload);
       this.pendingOverload = undefined;
       this.tele.clear();
@@ -1723,6 +1731,7 @@ GH.Boss = class Boss extends GH.Enemy {
           GH.Sfx.slam();
           this.view.setAngle(this.facing * -10);
           this.setState('stagger', time, m.stagger);
+          if (this.phase2Left > 0) this.phase2Left -= 1;
         }
         break;
       }
@@ -1746,6 +1755,7 @@ GH.Boss = class Boss extends GH.Enemy {
           } else {
             this.scene.tweens.add({ targets: s, y: this.groundY, duration: 300 });
             this.setState('idle', time, this.t(c.idle));
+            if (this.phase2Left > 0) this.phase2Left -= 1;
           }
         }
         break;
