@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v1.3',   // v1.1: 플레이테스트 피드백으로 튜토리얼과 상황별 안내 추가 (게임 규칙과 수치는 v1.0과 동일)
+  version: 'v1.4',   // v1.1: 플레이테스트 피드백으로 튜토리얼과 상황별 안내 추가 (게임 규칙과 수치는 v1.0과 동일)
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -103,7 +103,8 @@ GH.CONFIG = {
       // v1.3: 예고 450 → 380ms, 덮치기 거리 150 → 190, HP 30 → 36 ("섹터 3이 섹터 2보다 쉽다")
       hp: 36, walkSpeed: 90, hopRange: 190, windup: 380, hopSpeed: 300, hopPower: 380,
       recover: 600, damage: 10,
-      mini: { hp: 10, walkSpeed: 140, windup: 320, hopSpeed: 300, damage: 6, scale: 0.6 },
+      // v1.4: 분열 직후 0.5초 보호(죽이는 순간의 파동/콤보에 바로 사라지지 않도록), HP 10 → 14
+      mini: { hp: 14, walkSpeed: 140, windup: 320, hopSpeed: 300, damage: 6, scale: 0.6, spawnProtect: 500 },
     },
     // 순간이동 해커: 플레이어 등 뒤에 표식(예고) → 순간이동 → 베기 → 빈틈
     hacker: {
@@ -508,7 +509,9 @@ GH.Run = {
     if (this.ready) return;
     this.ready = true;
     const params = new URLSearchParams(location.search);
-    this.debug = params.get('debug') === '1';
+    this.debug = params.get('debug') === '1' || params.get('debug') === '2';
+    this.showDebug = params.get('debug') === '2';         // 화면에 디버그 정보 표시는 debug=2일 때만
+    this.forceTutorial = params.get('tutorial') === '1';  // 튜토리얼 다시 보기
     // 유입 출처: 링크의 ?src=이름 (예: friends, disquiet). 없으면 이전 페이지 주소의 도메인, 그것도 없으면 direct
     let ref = '';
     try { ref = document.referrer ? new URL(document.referrer).hostname : ''; } catch (e) { ref = ''; }
@@ -1481,10 +1484,16 @@ GH.Virus = class Virus extends GH.Enemy {
     // 분열: 작은 바이러스 2마리가 양옆으로 튀어나옴
     GH.Sfx.split();
     const scene = this.scene;
+    scene.popText(x, y - 50, 'SPLIT!', '#4dff9a', 24);
+    const protect = GH.CONFIG.enemies.virus.mini.spawnProtect;
     [-1, 1].forEach((side) => {
       const m = new GH.Virus(scene, x + side * 16, y - 6, true);
       m.sprite.setVelocity(side * 180, -260);
       m.setState('stun', scene.time.now, 400);
+      // 태어난 직후 잠깐은 공격받지 않음 (깜빡임으로 표시)
+      m.untargetable = true;
+      scene.tweens.add({ targets: m.view, alpha: 0.4, duration: 80, yoyo: true, repeat: Math.floor(protect / 160) });
+      scene.time.delayedCall(protect, () => { m.untargetable = false; if (m.alive) m.view.setAlpha(1); });
       scene.addEnemy(m);
     });
   }
@@ -2608,7 +2617,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
         fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', fontSize: '11px', color: '#ffffff',
       }).setScrollFactor(0).setDepth(100).setAlpha(0.5);
     }
-    if (GH.Run.debug) {
+    if (GH.Run.showDebug) {
       const sk = GH.Run.skill === null ? '-' : GH.Run.skill;
       this.add.text(20, 488, `[DEBUG] group=${GH.Run.group}  skill=${sk}  difficulty=x${this.difficulty}  attempt=${GH.Run.attempts[L.id]}  (L: 로그 다운로드)`, {
         fontFamily: 'monospace', fontSize: '12px', color: '#ffe14f', backgroundColor: '#000000aa',
@@ -2616,7 +2625,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     }
     // 튜토리얼: 섹터 1을 이 브라우저에서 처음 할 때만
     this.tutorial = null;
-    if (L.id === 'S1' && GH.Run.store('gh_tutorial') !== '1') {
+    if (L.id === 'S1' && (GH.Run.store('gh_tutorial') !== '1' || (GH.Run.forceTutorial && GH.Run.attempts.S1 === 1))) {
       this.tutorial = new GH.Tutorial(this);
     } else {
       this.banner(L.title, L.sub, 1600);
@@ -3003,12 +3012,12 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     if (this.hintObjs) this.hintObjs.forEach((o) => o.destroy());
     const font = { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif' };
     // 왼쪽 HUD(게이지)를 가리지 않도록 가운데 오른쪽에 두고, 길면 두 줄로
-    const CX = 590, CY = 118;
+    const CX = 545, CY = 118;
     const t = this.add.text(CX, CY, msg, {
       ...font, fontSize: '18px', fontStyle: 'bold', color: '#ffffff', align: 'center',
-      wordWrap: { width: 560, useAdvancedWrap: true }, lineSpacing: 4,
+      wordWrap: { width: 470, useAdvancedWrap: true }, lineSpacing: 4,
     }).setOrigin(0.5).setScrollFactor(0).setDepth(241);
-    const w = Math.min(680, t.width + 100);
+    const w = Math.min(580, t.width + 100);
     const h = Math.max(46, t.height + 20);
     const bg = this.add.rectangle(CX, CY, w, h, 0x0a0618, 0.92).setStrokeStyle(3, GH.COLORS.neonYellow).setScrollFactor(0).setDepth(240);
     const tag = this.add.text(CX - w / 2 + 12, CY, 'TIP', { ...font, fontSize: '14px', fontStyle: 'bold', color: '#0a0618', backgroundColor: '#ffe14f', padding: { x: 6, y: 3 } })
