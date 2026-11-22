@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v1.1',   // v1.1: 플레이테스트 피드백으로 튜토리얼과 상황별 안내 추가 (게임 규칙과 수치는 v1.0과 동일)
+  version: 'v1.2',   // v1.1: 플레이테스트 피드백으로 튜토리얼과 상황별 안내 추가 (게임 규칙과 수치는 v1.0과 동일)
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -33,7 +33,9 @@ GH.CONFIG = {
     range: 0.20,           // 실력 보정 폭: ±20% (adaptive 그룹만)
     deathEase: 0.05,       // 보스에서 죽을 때마다 5%씩 완화 (adaptive 그룹만)
     // 실력 점수 기준: 섹터마다 이 정도 피격과 시간으로 깨면 보통(0점)
-    targets: { S1: { targetHits: 6, targetTime: 100 }, S2: { targetHits: 8, targetTime: 130 } },
+    targets: { S1: { targetHits: 6, targetTime: 100 }, S2: { targetHits: 8, targetTime: 130 }, S3: { targetHits: 9, targetTime: 140 } },
+    // 섹터별 기본 상승 배율 (두 그룹 공통). 섹터 3을 섹터 2와 보스 사이에 두고 보스는 그대로 유지
+    sectorBase: { S1: 1, S2: 1.08, S3: 1.12, BOSS: 1.16 },
     hitWeight: 0.6, timeWeight: 0.4,
     hitsPerDeath: 3,       // 섹터 1에서 한 번 죽으면 피격 3회로 환산
   },
@@ -95,6 +97,17 @@ GH.CONFIG = {
       // v0.5: 예고 500 → 650ms, 걸어오다 몸에 닿는 피해 5 → 0 (플레이 로그에서 사망 원인 1위)
       bashRange: 110, windup: 650, bashSpeed: 380, bashTime: 220, recover: 650,
       bashDamage: 12, touchDamage: 0,
+    },
+    // 분열 바이러스: 예고 후 튀어올라 덮침. 처치하면 작고 빠른 2마리로 한 번 분열
+    virus: {
+      hp: 30, walkSpeed: 80, hopRange: 150, windup: 450, hopSpeed: 280, hopPower: 380,
+      recover: 600, damage: 10,
+      mini: { hp: 10, walkSpeed: 140, windup: 320, hopSpeed: 300, damage: 6, scale: 0.6 },
+    },
+    // 순간이동 해커: 플레이어 등 뒤에 표식(예고) → 순간이동 → 베기 → 빈틈
+    hacker: {
+      hp: 36, detectRange: 520, mark: 750, behind: 90, slashWind: 200, slashTime: 160,
+      slashRange: 74, damage: 14, recover: 900, cooldown: 1800,
     },
     hitStun: 220,           // 맞으면 행동이 끊기는 시간(ms)
   },
@@ -299,6 +312,39 @@ GH.makeTextures = function (scene) {
   g.lineBetween(42, 26, 50, 26);
   g.generateTexture('fguard', 56, 52);
 
+  // ---- 분열 바이러스 44x38 ----
+  g.clear();
+  g.fillStyle(0x2fd08a, 1);
+  g.fillCircle(22, 22, 15);                    // 몸
+  g.fillCircle(10, 26, 8); g.fillCircle(34, 26, 8);
+  g.fillStyle(0x1a8a5a, 1);
+  [[6, 8], [22, 3], [38, 8], [3, 22], [41, 22]].forEach(([x, y]) => g.fillCircle(x, y, 3));   // 돌기
+  g.fillStyle(C.robotFace, 1);
+  g.fillRoundedRect(12, 16, 20, 11, 4);
+  g.fillStyle(C.neonYellow, 1);
+  g.fillCircle(17, 21, 3); g.fillCircle(27, 21, 3);
+  g.fillStyle(C.neonPink, 1);
+  g.fillRect(19, 31, 6, 2);
+  g.generateTexture('virus', 44, 38);
+
+  // ---- 순간이동 해커 44x56 (오른쪽을 봄) ----
+  g.clear();
+  g.fillStyle(0x6a5aa8, 1);
+  g.fillTriangle(22, 0, 4, 22, 40, 22);       // 후드
+  g.fillRoundedRect(6, 14, 32, 34, 8);
+  g.lineStyle(2, 0x4dff9a, 1);                 // 초록 테두리 (배경과 구분)
+  g.strokeTriangle(22, 1, 5, 22, 39, 22);
+  g.strokeRoundedRect(6, 14, 32, 34, 8);
+  g.fillStyle(C.robotFace, 1);
+  g.fillRoundedRect(12, 18, 22, 12, 4);
+  g.fillStyle(0x4dff9a, 1);
+  g.fillRect(22, 22, 10, 3);                   // 초록 바이저
+  g.fillStyle(0x3a2a66, 1);
+  g.fillRoundedRect(10, 48, 9, 8, 3); g.fillRoundedRect(25, 48, 9, 8, 3);
+  g.lineStyle(3, 0x4dff9a, 1);
+  g.lineBetween(36, 30, 44, 12);               // 칼날
+  g.generateTexture('hacker', 44, 56);
+
   // ---- 낙하 글리치 블록 ----
   g.clear();
   g.fillStyle(0x3a1670, 1);
@@ -439,6 +485,9 @@ GH.Sfx = {
   clank()     { this.tone(1800, 1200, 0.08, 'square', 0.18); this.tone(900, 700, 0.12, 'triangle', 0.15); },
   rank()      { [523, 784, 1047, 1568].forEach((f, i) => this.tone(f, f, 0.22, 'triangle', 0.15, i * 0.12)); },
   hint()     { this.tone(880, 1320, 0.1, 'triangle', 0.12); this.tone(1320, 1320, 0.12, 'triangle', 0.1, 0.1); },
+  split()    { this.tone(500, 900, 0.1, 'square', 0.12); this.tone(700, 1200, 0.1, 'square', 0.1, 0.06); },
+  blink()    { this.tone(1600, 300, 0.18, 'sawtooth', 0.12); this.noise(0.12, 'highpass', 2500, 0.2); },
+  slash()    { this.noise(0.1, 'highpass', 3500, 0.35); this.tone(900, 200, 0.1, 'sawtooth', 0.12); },
   clear()    { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f, 0.18, 'square', 0.12, i * 0.1)); },
 };
 
@@ -473,8 +522,8 @@ GH.Run = {
     this.sessionId = this.rid();
     this.hintsShown = {};                    // 상황별 안내는 세션당 한 번씩만            // 페이지를 열 때마다 새 세션
     this.version = GH.CONFIG.version;
-    this.attempts = { S1: 0, S2: 0, BOSS: 0 };
-    this.deaths = { S1: 0, S2: 0, BOSS: 0 };
+    this.attempts = { S1: 0, S2: 0, S3: 0, BOSS: 0 };
+    this.deaths = { S1: 0, S2: 0, S3: 0, BOSS: 0 };
     this.skills = {};                        // 섹터별 실력 점수 (-1 ~ 1)
     this.skill = null;                       // 지금까지의 실력 점수 (클리어한 섹터들의 평균)
     this.run = null;                         // 섹터 1부터 보스까지 한 판의 누적 기록
@@ -550,7 +599,7 @@ GH.Run = {
       overload: c.overload.join(','), pattern_hits: c.patternHits, difficulty: c.difficulty,
       ...extra,
     };
-    if ((c.sector === 'S1' || c.sector === 'S2') && result === 'clear') {
+    if ((c.sector === 'S1' || c.sector === 'S2' || c.sector === 'S3') && result === 'clear') {
       this.skills[c.sector] = GH.Adaptive.skillScore(c.sector, c.hits, duration, this.deaths[c.sector]);
       const vals = Object.values(this.skills);
       this.skill = Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100;
@@ -560,9 +609,8 @@ GH.Run = {
   },
 
   difficultyFor(sector) {
-    const index = { S1: 0, S2: 1, BOSS: 2 }[sector];
-    if (index === 0) return 1;
-    return GH.Adaptive.difficulty(this.group, index, this.skill, this.deaths[sector]);
+    if (sector === 'S1') return 1;
+    return GH.Adaptive.difficulty(this.group, sector, this.skill, this.deaths[sector]);
   },
 
   // 보스 처치: 한 판 요약 기록 후 초기화
@@ -576,7 +624,7 @@ GH.Run = {
     this.run = null;
     this.skills = {};
     this.skill = null;
-    this.deaths = { S1: 0, S2: 0, BOSS: 0 };
+    this.deaths = { S1: 0, S2: 0, S3: 0, BOSS: 0 };
     return summary;
   },
 
@@ -623,9 +671,9 @@ GH.Adaptive = {
   // 섹터 난이도 배율 (index: 섹터 2 = 1, 보스 = 2)
   // control: 기본 상승만 (섹터 2 x1.08, 보스 x1.16 고정)
   // adaptive: 기본 상승 x 실력 보정(±20%) x 그 섹터에서 죽을 때마다 완화(-5%)
-  difficulty(group, index, skill, sectorDeaths) {
+  difficulty(group, sector, skill, sectorDeaths) {
     const a = GH.CONFIG.adaptive;
-    const base = 1 + a.risePerSector * index;
+    const base = a.sectorBase[sector];
     const bossDeaths = sectorDeaths;
     if (group !== 'adaptive') return base;
     const s = skill === null ? 0 : skill;
@@ -1094,8 +1142,9 @@ GH.Enemy = class Enemy {
 
     // 찌그러짐
     scene.tweens.killTweensOf(this.view);
-    this.view.setScale(1.25, 0.8);
-    scene.tweens.add({ targets: this.view, scaleX: 1, scaleY: 1, duration: 180, ease: 'Back.Out' });
+    const bs = this.baseScale || 1;
+    this.view.setScale(1.25 * bs, 0.8 * bs);
+    scene.tweens.add({ targets: this.view, scaleX: bs, scaleY: bs, duration: 180, ease: 'Back.Out' });
 
     if (this.hp <= 0) { this.die(dir); return true; }
     return false;
@@ -1352,6 +1401,200 @@ GH.FirewallGuard = class FirewallGuard extends GH.Enemy {
     if (!this.alive || this.state === 'stun') return 0;
     return this.state === 'bash' ? this.cfg.bashDamage : this.cfg.touchDamage;
   }
+};
+
+// ---- 분열 바이러스: 예고 후 덮침. 처치하면 작은 바이러스 2마리로 한 번 분열 ----
+GH.Virus = class Virus extends GH.Enemy {
+  constructor(scene, x, y, mini = false) {
+    const base = GH.CONFIG.enemies.virus;
+    const src = mini ? { ...base, ...base.mini } : base;
+    super(scene, x, y, 'virus', GH.scaleCfg(src, scene.difficulty || 1, ['windup', 'recover'], ['walkSpeed', 'hopSpeed']), false);
+    this.mini = mini;
+    this.name = mini ? 'virus_mini' : 'virus';
+    if (mini) { this.view.setScale(base.mini.scale); this.sprite.setScale(base.mini.scale); }
+    this.sprite.body.setSize(30, 28).setOffset(7, 8);
+    this.baseScale = mini ? base.mini.scale : 1;
+    this.setState('walk', 0);
+  }
+
+  update(time, player) {
+    if (!this.alive) return;
+    const s = this.sprite;
+    const p = player.sprite;
+    const c = this.cfg;
+    const dx = p.x - s.x;
+    const dir = Math.sign(dx) || 1;
+    switch (this.state) {
+      case 'walk':
+        this.setFacing(dir);
+        s.setVelocityX(Math.abs(dx) < 600 ? dir * c.walkSpeed : 0);
+        // 꿈틀거림
+        this.view.setScale(this.baseScale * (1 + Math.sin(time / 90) * 0.06), this.baseScale * (1 - Math.sin(time / 90) * 0.06));
+        if (player.state !== 'dead' && Math.abs(dx) < (this.mini ? 110 : GH.CONFIG.enemies.virus.hopRange) && Math.abs(p.y - s.y) < 90 && s.body.blocked.down) {
+          s.setVelocityX(0);
+          this.setState('windup', time, c.windup);
+          this.showWarn(true);
+          this.view.setTint(GH.COLORS.neonYellow);
+          GH.Sfx.warn();
+          this.scene.hint('virus', '분열 바이러스! 쓰러뜨리면 둘로 갈라져요. 3타와 파동으로 한꺼번에 정리하세요');
+        }
+        break;
+      case 'windup':
+        this.view.setScale(this.baseScale * 1.2, this.baseScale * 0.75);   // 웅크림 예고
+        if (time >= this.stateUntil) {
+          this.showWarn(false);
+          this.view.clearTint();
+          this.view.setScale(this.baseScale * 0.85, this.baseScale * 1.2);
+          s.setVelocity(this.facing * c.hopSpeed, -GH.CONFIG.enemies.virus.hopPower * (this.mini ? 0.8 : 1));
+          this.setState('hop', time, 900);
+        }
+        break;
+      case 'hop':
+        if ((s.body.blocked.down && time > this.stateUntil - 750) || time >= this.stateUntil) {
+          s.setVelocityX(0);
+          this.view.setScale(this.baseScale);
+          this.setState('recover', time, c.recover);
+        }
+        break;
+      case 'recover':
+        if (time >= this.stateUntil) this.setState('walk', time);
+        break;
+      case 'stun':
+        s.setVelocityX(s.body.velocity.x * 0.88);
+        if (time >= this.stateUntil) this.setState('walk', time);
+        break;
+    }
+  }
+
+  contactDamage() {
+    if (!this.alive || this.state === 'stun') return 0;
+    return this.state === 'hop' ? this.cfg.damage : 0;
+  }
+
+  die(dir) {
+    const x = this.sprite.x, y = this.sprite.y;
+    super.die(dir);
+    if (this.mini) return;
+    // 분열: 작은 바이러스 2마리가 양옆으로 튀어나옴
+    GH.Sfx.split();
+    const scene = this.scene;
+    [-1, 1].forEach((side) => {
+      const m = new GH.Virus(scene, x + side * 16, y - 6, true);
+      m.sprite.setVelocity(side * 180, -260);
+      m.setState('stun', scene.time.now, 400);
+      scene.addEnemy(m);
+    });
+  }
+};
+
+// ---- 순간이동 해커: 플레이어 등 뒤에 표식 → 순간이동 → 베기(정면 방패로 막힘) → 빈틈 ----
+GH.Hacker = class Hacker extends GH.Enemy {
+  constructor(scene, x, y) {
+    super(scene, x, y, 'hacker', GH.scaleCfg(GH.CONFIG.enemies.hacker, scene.difficulty || 1, ['mark', 'slashWind', 'recover', 'cooldown'], []), false);
+    this.name = 'hacker';
+    this.sprite.body.setSize(30, 48).setOffset(7, 8);
+    this.readyAt = 0;
+    this.markG = scene.add.graphics().setDepth(4);
+    this.setState('idle', 0);
+  }
+
+  update(time, player) {
+    if (!this.alive) return;
+    const s = this.sprite;
+    const p = player.sprite;
+    const c = this.cfg;
+    const dx = p.x - s.x;
+    switch (this.state) {
+      case 'idle':
+        this.setFacing(Math.sign(dx) || 1);
+        s.setVelocityX(0);
+        this.view.setAlpha(0.85 + Math.sin(time / 120) * 0.15);
+        if (player.state !== 'dead' && Math.abs(dx) < c.detectRange && Math.abs(p.y - s.y) < 120 && time >= this.readyAt) this.startMark(time, player);
+        break;
+      case 'mark': {
+        // 표식: 플레이어 등 뒤 바닥의 지직거리는 원 + 반투명 실루엣
+        const g = this.markG;
+        g.clear();
+        const k = 1 - Math.max(0, this.stateUntil - time) / c.mark;
+        g.lineStyle(3, 0x4dff9a, 0.6 + k * 0.4).strokeEllipse(this.markX, this.markGround, 60 - k * 20, 14);
+        g.fillStyle(0x4dff9a, 0.15 + k * 0.25).fillEllipse(this.markX, this.markGround, 60 - k * 20, 14);
+        if (this.ghost) { this.ghost.setAlpha(0.3 + k * 0.5).setX(this.markX + Phaser.Math.Between(-3, 3)); }
+        this.view.setAlpha(Math.floor(time / 60) % 2 ? 0.3 : 0.9);
+        if (time >= this.stateUntil) this.doBlink(time, player);
+        break;
+      }
+      case 'slash_wind':
+        if (time >= this.stateUntil) this.doSlash(time, player);
+        break;
+      case 'recover':
+        this.view.setAngle(this.facing * 8);
+        if (time >= this.stateUntil) { this.view.setAngle(0); this.setState('idle', time); }
+        break;
+      case 'stun':
+        s.setVelocityX(s.body.velocity.x * 0.88);
+        if (time >= this.stateUntil) { this.view.setAngle(0); this.clearMark(); this.setState('idle', time); }
+        break;
+    }
+  }
+
+  startMark(time, player) {
+    const p = player.sprite;
+    const c = this.cfg;
+    // 플레이어가 바라보는 반대쪽(등 뒤)에 표식
+    const W = this.scene.worldW || GH.CONFIG.world.width;
+    this.markX = Phaser.Math.Clamp(p.x - player.facing * c.behind, 30, W - 30);
+    this.markGround = player.standY || GH.CONFIG.world.groundY;
+    this.markY = this.markGround - 28;
+    this.ghost = this.scene.add.image(this.markX, this.markY, 'hacker').setTint(0x4dff9a).setAlpha(0.3).setDepth(5)
+      .setFlipX(p.x < this.markX);
+    this.setState('mark', time, c.mark);
+    GH.Sfx.warn();
+    this.scene.hint('hacker', '해커가 등 뒤로 순간이동해요! 초록 표식 쪽으로 돌아서 ↓ 방패를 들거나 대시로 피하세요');
+  }
+
+  doBlink(time, player) {
+    const s = this.sprite;
+    this.scene.burst(s.x, s.y, 10, 0x4dff9a);
+    s.setPosition(this.markX, this.markY);
+    s.setVelocity(0, 0);
+    this.setFacing(player.sprite.x < this.markX ? -1 : 1);
+    this.view.setAlpha(1);
+    this.clearMark();
+    this.scene.burst(this.markX, this.markY, 14, 0x4dff9a);
+    GH.Sfx.blink();
+    this.setState('slash_wind', time, this.cfg.slashWind);
+    this.view.setTint(0x4dff9a);
+  }
+
+  doSlash(time, player) {
+    const s = this.sprite;
+    const c = this.cfg;
+    this.view.clearTint();
+    GH.Sfx.slash();
+    // 베기 이펙트
+    const fx = this.scene.add.image(s.x + this.facing * 30, s.y, 'slash').setTint(0x4dff9a).setFlipX(this.facing < 0).setScale(1.5, 1.3).setDepth(11);
+    this.scene.tweens.add({ targets: fx, alpha: 0, duration: 180, onComplete: () => fx.destroy() });
+    const r = new Phaser.Geom.Rectangle(s.x + (this.facing > 0 ? 0 : -c.slashRange), s.y - 30, c.slashRange, 60);
+    if (Phaser.Geom.Intersects.RectangleToRectangle(r, player.sprite.getBounds())) {
+      const res = player.takeDamage(c.damage, s.x, 'charge', 'hacker_slash');
+      if (res === 'blocked') this.scene.popText(s.x, s.y - 50, 'GUARD', '#35f2ff', 18);
+    }
+    this.readyAt = time + c.cooldown;
+    this.setState('recover', time, c.recover);
+  }
+
+  clearMark() {
+    this.markG.clear();
+    if (this.ghost) { this.ghost.destroy(); this.ghost = null; }
+  }
+
+  die(dir) {
+    this.clearMark();
+    this.markG.destroy();
+    super.die(dir);
+  }
+
+  contactDamage() { return 0; }
 };
 
 
@@ -2428,7 +2671,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
       if (e.alive && !e.untargetable && this.player.state !== 'dead') {
         const dmg = e.contactDamage();
         if (dmg > 0 && Phaser.Geom.Intersects.RectangleToRectangle(this.player.sprite.getBounds(), e.sprite.getBounds())) {
-          const kind = (e.state === 'charge' || e.state === 'bash' || e.state === 'mirror_charge') ? 'charge' : 'touch';
+          const kind = ['charge', 'bash', 'mirror_charge', 'hop'].includes(e.state) ? 'charge' : 'touch';
           const src = e.sourceName ? e.sourceName(kind) : `${e.name}_${kind}`;
           const r = this.player.takeDamage(dmg, e.sprite.x, kind, src);
           if (r === 'blocked') {
@@ -2558,6 +2801,13 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
   hitstop(ms) {
     this.physics.world.pause();
     this.time.delayedCall(ms, () => this.physics.world.resume());
+  }
+
+  // 싸움 도중 새로 생긴 적 (분열 등)
+  addEnemy(e) {
+    this.enemies.push(e);
+    this.physics.add.collider(e.sprite, this.solids);
+    this.totalEnemies += 1;
   }
 
   onEnemyKilled(e) {
@@ -2735,13 +2985,18 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     this.hintShownAt = this.time.now;
     if (this.hintObjs) this.hintObjs.forEach((o) => o.destroy());
     const font = { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif' };
-    const t = this.add.text(500, 112, msg, { ...font, fontSize: '19px', fontStyle: 'bold', color: '#ffffff' })
-      .setOrigin(0.5).setScrollFactor(0).setDepth(241);
-    const w = t.width + 110;
-    const bg = this.add.rectangle(480, 112, w, 46, 0x0a0618, 0.92).setStrokeStyle(3, GH.COLORS.neonYellow).setScrollFactor(0).setDepth(240);
-    const tag = this.add.text(480 - w / 2 + 14, 112, 'TIP', { ...font, fontSize: '14px', fontStyle: 'bold', color: '#0a0618', backgroundColor: '#ffe14f', padding: { x: 6, y: 3 } })
+    // 왼쪽 HUD(게이지)를 가리지 않도록 가운데 오른쪽에 두고, 길면 두 줄로
+    const CX = 590, CY = 118;
+    const t = this.add.text(CX, CY, msg, {
+      ...font, fontSize: '18px', fontStyle: 'bold', color: '#ffffff', align: 'center',
+      wordWrap: { width: 560, useAdvancedWrap: true }, lineSpacing: 4,
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(241);
+    const w = Math.min(680, t.width + 100);
+    const h = Math.max(46, t.height + 20);
+    const bg = this.add.rectangle(CX, CY, w, h, 0x0a0618, 0.92).setStrokeStyle(3, GH.COLORS.neonYellow).setScrollFactor(0).setDepth(240);
+    const tag = this.add.text(CX - w / 2 + 12, CY, 'TIP', { ...font, fontSize: '14px', fontStyle: 'bold', color: '#0a0618', backgroundColor: '#ffe14f', padding: { x: 6, y: 3 } })
       .setOrigin(0, 0.5).setScrollFactor(0).setDepth(241);
-    t.setX(480 + 22);
+    t.setX(CX + 22);
     const objs = [bg, t, tag];
     this.hintObjs = objs;
     objs.forEach((o) => { o.setScale(0.85); o.setAlpha(0); });
@@ -2770,7 +3025,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     const font = { fontFamily: 'Pretendard, "Noto Sans KR", sans-serif', color: '#ffffff' };
     this.add.text(20, 16, 'GLITCH HUNTER', { ...font, fontSize: '22px', fontStyle: 'bold', color: '#35f2ff' }).setScrollFactor(0).setDepth(100);
     // 진행 표시: SECTOR 1 > SECTOR 2 > BOSS
-    const steps = [['S1', 'SECTOR 1'], ['S2', 'SECTOR 2'], ['BOSS', 'BOSS']];
+    const steps = [['S1', 'SECTOR 1'], ['S2', 'SECTOR 2'], ['S3', 'SECTOR 3'], ['BOSS', 'BOSS']];
     let px = 20;
     steps.forEach(([id, label], i) => {
       const cur = this.L && this.L.id === id;
@@ -2829,7 +3084,7 @@ GH.Sector2Scene = class Sector2Scene extends GH.SectorScene {
       name: 'SECTOR 2', title: 'SECTOR 2', sub: '방화벽 구역: 장애물을 피해 돌파하라',
       // 전기 바닥 위 발판, 낙하 블록 구역의 피난처 발판
       platforms: [[1330, 360], [1500, 320], [1840, 370], [2060, 330]],
-      playerX: 120, gate: true, next: 'Boss',
+      playerX: 120, gate: true, next: 'Sector3',
     };
   }
 
@@ -2847,6 +3102,41 @@ GH.Sector2Scene = class Sector2Scene extends GH.SectorScene {
     this.hazards.push(new GH.ElectricFloor(this, 1240, 1600, 0));
     this.hazards.push(new GH.FallingBlocks(this, 1720, 2180));
     this.hazards.push(new GH.LaserWall(this, 2230, 1200));
+  }
+};
+
+
+// ===== src/scenes/Sector3Scene.js =====
+// SECTOR 3: 데이터 코어 구역 - 새 몬스터를 하나씩 소개한 뒤 섞어서 출제 (심화)
+window.GH = window.GH || {};
+
+GH.Sector3Scene = class Sector3Scene extends GH.SectorScene {
+  constructor() { super('Sector3'); }
+
+  levelConfig() {
+    return {
+      id: 'S3', width: 3100,
+      name: 'SECTOR 3', title: 'SECTOR 3', sub: '데이터 코어 구역: 새로운 버그가 기다린다',
+      platforms: [[560, 370], [1250, 360], [1480, 320], [2050, 370], [2300, 320], [2650, 360]],
+      playerX: 120, gate: true, next: 'Boss',
+    };
+  }
+
+  spawnEnemies(groundY) {
+    // 1) 소개: 분열 바이러스만
+    this.enemies.push(new GH.Virus(this, 760, groundY - 25));
+    // 2) 소개: 순간이동 해커만
+    this.enemies.push(new GH.Hacker(this, 1350, groundY - 28));
+    // 3) 조합: 바이러스 + 해커 + 드론, 장애물과 함께
+    this.enemies.push(new GH.Virus(this, 2150, groundY - 25));
+    this.enemies.push(new GH.Hacker(this, 2450, groundY - 28));
+    this.enemies.push(new GH.Shooter(this, 2600, 260));
+    this.enemies.push(new GH.Virus(this, 2800, groundY - 25));
+  }
+
+  spawnHazards() {
+    this.hazards.push(new GH.LaserWall(this, 1850, 600));
+    this.hazards.push(new GH.FallingBlocks(this, 2250, 2700));
   }
 };
 
@@ -3033,7 +3323,7 @@ window.addEventListener('load', () => {
       arcade: { gravity: { y: GH.CONFIG.gravity }, debug: false },
     },
     scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
-    scene: [GH.SectorScene, GH.Sector2Scene, GH.BossScene],
+    scene: [GH.SectorScene, GH.Sector2Scene, GH.Sector3Scene, GH.BossScene],
   });
 });
 
