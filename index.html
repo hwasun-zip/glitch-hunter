@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v1.4',   // v1.1: 플레이테스트 피드백으로 튜토리얼과 상황별 안내 추가 (게임 규칙과 수치는 v1.0과 동일)
+  version: 'v1.5',   // v1.1: 플레이테스트 피드백으로 튜토리얼과 상황별 안내 추가 (게임 규칙과 수치는 v1.0과 동일)
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -715,6 +715,12 @@ GH.Player = class Player {
     // 보이는 그림은 따로: 찌그러짐 연출이 물리 판정 크기를 바꾸지 않도록 분리
     this.view = scene.add.image(x, y, 'robot').setDepth(10);
     this.shieldView = scene.add.image(x, y, 'shield').setDepth(11).setVisible(false);
+    // 캐릭터 옆 자원 UI (대시 쿨다운, 방패 게이지, 탄창): 필요할 때만 로봇 등 뒤쪽에 표시
+    this.ui = scene.add.graphics().setDepth(13);
+    this.dashFlashUntil = 0;
+    this.ammoFlashUntil = 0;
+    this.wasDashReady = true;
+    this.wasAmmoFull = true;
     scene.events.on('postupdate', this.sync, this);
     scene.events.once('shutdown', () => scene.events.off('postupdate', this.sync, this));
 
@@ -746,6 +752,67 @@ GH.Player = class Player {
   sync() {
     this.view.setPosition(this.sprite.x, this.sprite.y);
     this.shieldView.setPosition(this.sprite.x + this.facing * 24, this.sprite.y).setFlipX(this.facing < 0);
+    this.drawUI();
+  }
+
+  // 등 뒤쪽(바라보는 반대편)에 그려서 방패와 공격 이펙트에 가리지 않게 함
+  drawUI() {
+    const g = this.ui;
+    g.clear();
+    if (this.state === 'dead') return;
+    const t = this.scene.time.now;
+    const C = GH.COLORS;
+    const x = this.view.x, y = this.view.y;
+    const back = -this.facing;
+
+    // ---- 대시: 충전 중에만 원형 게이지, 다 차면 반짝하고 사라짐 ----
+    const dr = this.dashCooldownRatio(t);
+    const dashReady = dr >= 1;
+    if (dashReady && !this.wasDashReady) this.dashFlashUntil = t + 260;
+    this.wasDashReady = dashReady;
+    const dx = x + back * 24, dy = y - 38;
+    if (!dashReady) {
+      g.lineStyle(4, 0x000000, 0.55).strokeCircle(dx, dy, 8);
+      g.lineStyle(4, C.neonPurple, 1);
+      g.beginPath();
+      g.arc(dx, dy, 8, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * dr, false);
+      g.strokePath();
+    } else if (t < this.dashFlashUntil) {
+      const a = (this.dashFlashUntil - t) / 260;
+      g.lineStyle(4, C.neonYellow, a).strokeCircle(dx, dy, 8 + (1 - a) * 5);
+    }
+
+    // ---- 방패: 들고 있거나 줄어 있을 때 세로 게이지 (깨지면 빨강) ----
+    const gc = this.cfg.guard;
+    const locked = t < this.guardLockedUntil;
+    const gr = this.guardGauge / gc.max;
+    if (this.state === 'guard' || gr < 0.999 || locked) {
+      const gx = x + back * 34, top = y - 22, h = 44, w = 8;
+      g.fillStyle(0x0a0618, 0.8).fillRoundedRect(gx - w / 2 - 2, top - 2, w + 4, h + 4, 5);
+      g.fillStyle(locked ? C.danger : C.neonYellow, locked ? 0.7 : 1).fillRoundedRect(gx - w / 2, top + h * (1 - gr), w, Math.max(2, h * gr), 3);
+      g.lineStyle(2, locked ? C.danger : C.neonCyan, 1).strokeRoundedRect(gx - w / 2 - 2, top - 2, w + 4, h + 4, 5);
+    }
+
+    // ---- 탄창: 남은 발 수 (리볼버 탄창 모양), 충전 중인 칸이 차오름 ----
+    const sc = this.cfg.shot;
+    const full = this.ammo >= sc.maxAmmo;
+    if (full && !this.wasAmmoFull) this.ammoFlashUntil = t + 260;
+    this.wasAmmoFull = full;
+    if (!full || t < this.ammoFlashUntil) {
+      const ax = x + back * 20, ay = y + 30;
+      const fade = full ? (this.ammoFlashUntil - t) / 260 : 1;
+      g.fillStyle(C.neonYellow, 0.95 * fade).fillCircle(ax, ay, 10);
+      g.lineStyle(2, 0x8a6a10, fade).strokeCircle(ax, ay, 10);
+      g.fillStyle(0x0a0618, fade).fillCircle(ax, ay, 2);
+      const reload = full ? 1 : Phaser.Math.Clamp(1 - (this.nextReloadAt - t) / sc.reload, 0, 1);
+      for (let i = 0; i < sc.maxAmmo; i++) {
+        const ang = -Math.PI / 2 + (Math.PI * 2 * i) / sc.maxAmmo;
+        const cx = ax + Math.cos(ang) * 5.5, cy = ay + Math.sin(ang) * 5.5;
+        g.fillStyle(0x2a1a40, fade).fillCircle(cx, cy, 3);
+        if (i < this.ammo) g.fillStyle(C.neonPink, fade).fillCircle(cx, cy, 3);
+        else if (i === this.ammo) g.fillStyle(C.neonPink, 0.35 + reload * 0.4).fillCircle(cx, cy, 3 * reload);
+      }
+    }
   }
 
   get onGround() {
@@ -3066,9 +3133,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     this.add.text(940, 16, '← → 이동   ↑/Space 점프   Z 공격   ↑+Z 올려베기   C 사격   ↓ 방패   X 대시   M 소리', { ...font, fontSize: '13px' })
       .setOrigin(1, 0).setScrollFactor(0).setDepth(100).setAlpha(0.8);
     this.add.text(20, 72, 'HP', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
-    this.add.text(20, 92, 'DASH', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
-    this.add.text(20, 110, 'GUARD', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
-    this.add.text(20, 128, 'SHOT', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
+    // 대시, 방패, 탄창은 캐릭터 옆에 표시 (player.drawUI)
     this.enemyText = this.add.text(940, 40, '', { ...font, fontSize: '14px', color: '#ffe14f' }).setOrigin(1, 0).setScrollFactor(0).setDepth(100);
     this.comboText = this.add.text(940, 70, '', {
       ...font, fontSize: '28px', fontStyle: 'bold', color: '#ffe14f', stroke: '#ff4fd8', strokeThickness: 5,
@@ -3082,16 +3147,6 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     g.clear();
     g.fillStyle(0x000000, 0.5).fillRect(72, 74, 160, 10);
     g.fillStyle(p.hp > 30 ? GH.COLORS.neonCyan : GH.COLORS.danger, 1).fillRect(72, 74, 160 * (p.hp / p.cfg.maxHp), 10);
-    const r = p.dashCooldownRatio(time);
-    g.fillStyle(0x000000, 0.5).fillRect(72, 94, 80, 8);
-    g.fillStyle(r >= 1 ? GH.COLORS.neonYellow : GH.COLORS.neonPurple, 1).fillRect(72, 94, 80 * r, 8);
-    const gc = p.cfg.guard;
-    const locked = time < p.guardLockedUntil;
-    g.fillStyle(0x000000, 0.5).fillRect(72, 112, 80, 8);
-    g.fillStyle(locked ? GH.COLORS.danger : GH.COLORS.neonCyan, locked ? 0.5 : 1).fillRect(72, 112, 80 * (p.guardGauge / gc.max), 8);
-    for (let i = 0; i < p.cfg.shot.maxAmmo; i++) {
-      g.fillStyle(i < p.ammo ? GH.COLORS.neonCyan : 0x333355, 1).fillRoundedRect(72 + i * 22, 129, 16, 8, 3);
-    }
     this.enemyText.setText(`남은 버그 ${this.totalEnemies - this.kills} / ${this.totalEnemies}`);
   }
 };
