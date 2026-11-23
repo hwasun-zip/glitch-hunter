@@ -21,7 +21,7 @@
 window.GH = window.GH || {};
 
 GH.CONFIG = {
-  version: 'v1.5',   // v1.1: 플레이테스트 피드백으로 튜토리얼과 상황별 안내 추가 (게임 규칙과 수치는 v1.0과 동일)
+  version: 'v1.7',   // v1.1: 플레이테스트 피드백으로 튜토리얼과 상황별 안내 추가 (게임 규칙과 수치는 v1.0과 동일)
   screen: { width: 960, height: 540 },
 
   // ===== 플레이 로그 전송 주소 (구글 Apps Script 웹 앱 URL). 비워 두면 브라우저에만 저장 =====
@@ -61,7 +61,8 @@ GH.CONFIG = {
     // 대시로 친 적은 뒤쪽으로 튕기고 더 오래 경직(stun) → 로봇이 통과해 지나갈 수 있음
     dash: { speed: 760, duration: 170, cooldown: 700, damage: 8, knockback: 140, stun: 450, afterSafe: 250 },
     // 원거리 사격 (C): 근접보다 약하게, 탄 수 제한
-    shot: { damage: 5, speed: 640, knockback: 70, cooldown: 220, maxAmmo: 3, reload: 900 },
+    // v1.6: 3발 → 5발, 충전 0.9초 → 1.6초 (거의 무한이던 사격을 "관리하는 자원"으로)
+    shot: { damage: 5, speed: 640, knockback: 70, cooldown: 220, maxAmmo: 5, reload: 1600 },
     // 방패 (↓ 누르고 있기): 정면 공격만 막음
     guard: {
       max: 100,
@@ -114,6 +115,16 @@ GH.CONFIG = {
       doubleBlink: true, secondGap: 280, secondMarkRatio: 0.7,
     },
     hitStun: 220,           // 맞으면 행동이 끊기는 시간(ms)
+  },
+
+  // ===== 아이템 (v1.7) =====
+  // 적이 쓰러질 때 dropChance 확률로 떨어짐(작은 바이러스는 miniDropChance). weights는 종류별 비율
+  items: {
+    dropChance: 0.35, miniDropChance: 0.1, lifetime: 10000,
+    weights: { hp10: 30, hp30: 18, hp50: 7, hpfull: 2, ammo: 25, shield: 9, rapid: 9 },
+    shieldTime: 4000,      // 완전 방패: 무엇에 맞아도 HP가 줄지 않는 시간(ms)
+    rapidTime: 5000,       // 따발총: 탄 소모 없이 연사하는 시간(ms)
+    rapidInterval: 90,     // 따발총 연사 간격(ms)
   },
 
   // ===== 섹터 2 지형 장애물 (방패로 못 막음) =====
@@ -363,6 +374,32 @@ GH.makeTextures = function (scene) {
   g.fillRect(10, 32, 6, 6);
   g.generateTexture('gblock', 44, 44);
 
+  // ---- 아이템 아이콘 24x24 ----
+  g.clear();   // 회복: 하트 (색은 종류별 tint)
+  g.fillStyle(0xffffff, 1);
+  g.fillCircle(8, 9, 6); g.fillCircle(16, 9, 6);
+  g.fillTriangle(2, 11, 22, 11, 12, 22);
+  g.generateTexture('item_hp', 24, 24);
+  g.clear();   // 탄약
+  g.fillStyle(0x0a0618, 0.8).fillCircle(12, 12, 11);
+  g.fillStyle(C.neonCyan, 1).fillRoundedRect(7, 4, 10, 16, 5);
+  g.fillStyle(0xffffff, 1).fillRect(9, 7, 6, 3);
+  g.generateTexture('item_ammo', 24, 24);
+  g.clear();   // 완전 방패: 금색 방패 + 별
+  g.fillStyle(0xffd34f, 1);
+  g.fillRoundedRect(4, 2, 16, 13, 4);
+  g.fillTriangle(4, 12, 20, 12, 12, 23);
+  g.fillStyle(0xffffff, 1);
+  g.fillTriangle(12, 5, 9, 13, 15, 13); g.fillTriangle(8, 9, 16, 9, 12, 15);
+  g.generateTexture('item_shield', 24, 24);
+  g.clear();   // 따발총: 주황 총
+  g.fillStyle(0xff8a3b, 1);
+  g.fillRoundedRect(2, 7, 18, 7, 2);
+  g.fillRect(6, 13, 5, 8);
+  g.fillStyle(0xffe14f, 1);
+  g.fillRect(19, 8, 4, 2); g.fillRect(19, 12, 4, 2);
+  g.generateTexture('item_rapid', 24, 24);
+
   // ---- 보스: 폭주 AI "CORE.EXE" 130x110 ----
   g.clear();
   g.fillStyle(C.danger, 1);
@@ -492,6 +529,10 @@ GH.Sfx = {
   split()    { this.tone(500, 900, 0.1, 'square', 0.12); this.tone(700, 1200, 0.1, 'square', 0.1, 0.06); },
   blink()    { this.tone(1600, 300, 0.18, 'sawtooth', 0.12); this.noise(0.12, 'highpass', 2500, 0.2); },
   slash()    { this.noise(0.1, 'highpass', 3500, 0.35); this.tone(900, 200, 0.1, 'sawtooth', 0.12); },
+  item()     { this.tone(988, 1319, 0.08, 'square', 0.12); this.tone(1319, 1760, 0.1, 'square', 0.1, 0.07); },
+  powerUp()  { [523, 659, 784, 1047, 1319].forEach((f, i) => this.tone(f, f * 1.01, 0.09, 'square', 0.1, i * 0.05)); },
+  rapidShot(){ this.tone(1700, 900, 0.04, 'square', 0.06); },
+  immune()   { this.tone(1800, 2200, 0.06, 'triangle', 0.12); },
   clear()    { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, f, 0.18, 'square', 0.12, i * 0.1)); },
 };
 
@@ -533,6 +574,7 @@ GH.Run = {
     this.skills = {};                        // 섹터별 실력 점수 (-1 ~ 1)
     this.skill = null;                       // 지금까지의 실력 점수 (클리어한 섹터들의 평균)
     this.run = null;                         // 섹터 1부터 보스까지 한 판의 누적 기록
+    this.carryItem = null;                   // 다음 섹터로 들고 가는 특수 아이템
     this.current = null;
     this.local = this.loadLocal();
 
@@ -589,6 +631,12 @@ GH.Run = {
   },
 
   // 무력화 결과: 성공은 "O", 실패는 "X" + 남은 게이지 % (예: X42 = 42% 남기고 실패)
+  // 아이템 줍기/사용 기록 (상세 열에 종류)
+  itemEvent(action, type) {
+    const c = this.current;
+    this.log('item', { sector: c ? c.sector : '', attempt: c ? c.attempt : '', result: action, pattern_hits: { type } });
+  },
+
   overloadResult(success, leftRatio = 0) {
     if (this.current) this.current.overload.push(success ? 'O' : 'X' + Math.round(leftRatio * 100));
   },
@@ -628,6 +676,7 @@ GH.Run = {
     // 시트의 기존 열에 맞추기 위해 랭크와 쓰러진 횟수는 상세(JSON) 열에 함께 기록
     this.log('run_complete', { sector: 'RUN', result: 'clear', duration_s: total, damage_taken: r.damage, overload, skill_score: this.skill, pattern_hits: { rank, run_deaths: r.deaths } });
     this.run = null;
+    this.carryItem = null;
     this.skills = {};
     this.skill = null;
     this.deaths = { S1: 0, S2: 0, S3: 0, BOSS: 0 };
@@ -721,6 +770,12 @@ GH.Player = class Player {
     this.ammoFlashUntil = 0;
     this.wasDashReady = true;
     this.wasAmmoFull = true;
+    this.hpLag = this.cfg.maxHp;
+    // 아이템: 특수 아이템 1칸(섹터를 넘어가도 유지), 완전 방패/따발총 효과 시간
+    this.item = GH.Run.carryItem || null;
+    this.superUntil = 0;
+    this.rapidUntil = 0;
+    this.immuneMsgAt = 0;   // 맞았을 때 흰 잔상이 천천히 줄어드는 HP
     scene.events.on('postupdate', this.sync, this);
     scene.events.once('shutdown', () => scene.events.off('postupdate', this.sync, this));
 
@@ -745,7 +800,7 @@ GH.Player = class Player {
 
     const K = Phaser.Input.Keyboard.KeyCodes;
     this.keys = scene.input.keyboard.addKeys({
-      left: K.LEFT, right: K.RIGHT, up: K.UP, down: K.DOWN, space: K.SPACE, attack: K.Z, dash: K.X, shoot: K.C,
+      left: K.LEFT, right: K.RIGHT, up: K.UP, down: K.DOWN, space: K.SPACE, attack: K.Z, dash: K.X, shoot: K.C, use: K.V,
     });
   }
 
@@ -765,12 +820,36 @@ GH.Player = class Player {
     const x = this.view.x, y = this.view.y;
     const back = -this.facing;
 
+    // ---- HP: 머리 위에 항상 표시, 맞으면 흰 잔상이 천천히 따라 줄어듦 ----
+    const maxHp = this.cfg.maxHp;
+    this.hpLag = Math.max(this.hp, this.hpLag - maxHp * 0.012);
+    const hw = 40, hx = x - hw / 2, hy = y - 46;
+    g.fillStyle(0x0a0618, 0.85).fillRoundedRect(hx - 2, hy - 2, hw + 4, 9, 3);
+    g.fillStyle(0xffffff, 0.8).fillRect(hx, hy, hw * (this.hpLag / maxHp), 5);
+    g.fillStyle(this.hp > maxHp * 0.3 ? C.neonCyan : C.danger, 1).fillRect(hx, hy, hw * (this.hp / maxHp), 5);
+
+    // ---- 완전 방패: 금색 오라 + 남은 시간 ----
+    if (t < this.superUntil) {
+      const left = (this.superUntil - t) / GH.CONFIG.items.shieldTime;
+      const pulse = 1 + Math.sin(t / 80) * 0.06;
+      g.lineStyle(3, 0xffd34f, 0.4 + (left < 0.25 && Math.floor(t / 100) % 2 ? 0 : 0.5)).strokeCircle(x, y, 32 * pulse);
+      g.fillStyle(0xffd34f, 0.12).fillCircle(x, y, 32 * pulse);
+      g.lineStyle(3, 0xffffff, 0.9);
+      g.beginPath(); g.arc(x, y, 36, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * left, false); g.strokePath();
+    }
+    // ---- 따발총: 남은 시간 (주황 막대) ----
+    if (t < this.rapidUntil) {
+      const left = (this.rapidUntil - t) / GH.CONFIG.items.rapidTime;
+      g.fillStyle(0x0a0618, 0.8).fillRoundedRect(x - 22, y + 44, 44, 6, 3);
+      g.fillStyle(0xff8a3b, 1).fillRoundedRect(x - 21, y + 45, 42 * left, 4, 2);
+    }
+
     // ---- 대시: 충전 중에만 원형 게이지, 다 차면 반짝하고 사라짐 ----
     const dr = this.dashCooldownRatio(t);
     const dashReady = dr >= 1;
     if (dashReady && !this.wasDashReady) this.dashFlashUntil = t + 260;
     this.wasDashReady = dashReady;
-    const dx = x + back * 24, dy = y - 38;
+    const dx = x + back * 28, dy = y - 26;
     if (!dashReady) {
       g.lineStyle(4, 0x000000, 0.55).strokeCircle(dx, dy, 8);
       g.lineStyle(4, C.neonPurple, 1);
@@ -801,16 +880,16 @@ GH.Player = class Player {
     if (!full || t < this.ammoFlashUntil) {
       const ax = x + back * 20, ay = y + 30;
       const fade = full ? (this.ammoFlashUntil - t) / 260 : 1;
-      g.fillStyle(C.neonYellow, 0.95 * fade).fillCircle(ax, ay, 10);
-      g.lineStyle(2, 0x8a6a10, fade).strokeCircle(ax, ay, 10);
+      g.fillStyle(C.neonYellow, 0.95 * fade).fillCircle(ax, ay, 12);
+      g.lineStyle(2, 0x8a6a10, fade).strokeCircle(ax, ay, 12);
       g.fillStyle(0x0a0618, fade).fillCircle(ax, ay, 2);
       const reload = full ? 1 : Phaser.Math.Clamp(1 - (this.nextReloadAt - t) / sc.reload, 0, 1);
       for (let i = 0; i < sc.maxAmmo; i++) {
         const ang = -Math.PI / 2 + (Math.PI * 2 * i) / sc.maxAmmo;
-        const cx = ax + Math.cos(ang) * 5.5, cy = ay + Math.sin(ang) * 5.5;
-        g.fillStyle(0x2a1a40, fade).fillCircle(cx, cy, 3);
-        if (i < this.ammo) g.fillStyle(C.neonPink, fade).fillCircle(cx, cy, 3);
-        else if (i === this.ammo) g.fillStyle(C.neonPink, 0.35 + reload * 0.4).fillCircle(cx, cy, 3 * reload);
+        const cx = ax + Math.cos(ang) * 7, cy = ay + Math.sin(ang) * 7;
+        g.fillStyle(0x2a1a40, fade).fillCircle(cx, cy, 2.7);
+        if (i < this.ammo) g.fillStyle(C.neonPink, fade).fillCircle(cx, cy, 2.7);
+        else if (i === this.ammo) g.fillStyle(C.neonPink, 0.35 + reload * 0.4).fillCircle(cx, cy, 2.7 * reload);
       }
     }
   }
@@ -873,6 +952,17 @@ GH.Player = class Player {
       }
     }
 
+    // ---- 특수 아이템 사용 (V) ----
+    if (Phaser.Input.Keyboard.JustDown(k.use) && this.item) this.useItem(time);
+
+    // ---- 따발총: 누르고 있으면 탄 소모 없이 연사 ----
+    if (time < this.rapidUntil && k.shoot.isDown && this.state === 'normal' && time >= this.nextShotAt) {
+      this.nextShotAt = time + GH.CONFIG.items.rapidInterval;
+      const b = this.scene.spawnPlayerBullet(s.x + this.facing * 26, s.y - 2 + Phaser.Math.Between(-4, 4), this.facing * sc.speed, 0, sc.damage, false);
+      if (b) b.setTintFill(0xff8a3b);
+      this.view.x -= this.facing * 2;
+      GH.Sfx.rapidShot();
+    } else
     // ---- 사격 ----
     if (Phaser.Input.Keyboard.JustDown(k.shoot) && this.state === 'normal' && this.ammo > 0 && time >= this.nextShotAt) {
       this.ammo -= 1;
@@ -933,6 +1023,23 @@ GH.Player = class Player {
       }
       if (this.slashFx) this.slashFx.setPosition(s.x + this.facing * 34, s.y);
     }
+  }
+
+  useItem(time) {
+    const type = this.item;
+    const c = GH.CONFIG.items;
+    this.item = null;
+    GH.Run.carryItem = null;
+    GH.Sfx.powerUp();
+    if (type === 'shield') {
+      this.superUntil = time + c.shieldTime;
+      this.scene.popText(this.sprite.x, this.sprite.y - 64, '완전 방패!', '#ffd34f', 20);
+    } else if (type === 'rapid') {
+      this.rapidUntil = time + c.rapidTime;
+      this.scene.popText(this.sprite.x, this.sprite.y - 64, '따발총! (C 누르고 있기)', '#ff8a3b', 18);
+    }
+    this.scene.cameras.main.flash(120, 255, 220, 120);
+    GH.Run.itemEvent('use', type);
   }
 
   endGuard() {
@@ -1067,6 +1174,16 @@ GH.Player = class Player {
     const scene = this.scene;
     const time = scene.time.now;
     if (this.isInvincible(time)) return false;
+
+    // 완전 방패(아이템): 무엇에 맞아도 HP가 줄지 않음
+    if (time < this.superUntil) {
+      if (time > this.immuneMsgAt) {
+        this.immuneMsgAt = time + 500;
+        GH.Sfx.immune();
+        scene.popText(this.sprite.x, this.sprite.y - 56, 'IMMUNE', '#ffd34f', 16);
+      }
+      return 'blocked';
+    }
 
     // 방패: 바라보는 쪽에서 온 공격만 막음
     if (this.state === 'guard' && kind !== 'hazard' && kind !== 'blast') {
@@ -1877,7 +1994,7 @@ GH.Tutorial = class Tutorial {
       { key: '↑ + Z', text: '↑를 누른 채 Z: 올려베기. 공중의 적을 노려요', done: () => p.hitbox && p.hitbox.up },
       { key: 'X', text: '대시! 잠깐 무적이 되어 적과 공격을 뚫고 지나가요', done: () => p.state === 'dash' },
       { key: '↓ (누르고 있기)', text: '방패! 정면 공격을 막아요. 막을수록 게이지가 줄어요', done: () => p.state === 'guard' && this.heldGuard() },
-      { key: 'C', text: '사격! 멀리 있는 적을 견제해요 (3발, 자동 충전)', done: () => p.ammo < p.cfg.shot.maxAmmo },
+      { key: 'C', text: '사격! 멀리 있는 적을 견제해요 (5발, 천천히 자동 충전)', done: () => p.ammo < p.cfg.shot.maxAmmo },
     ];
     this.build();
     this.showStep();
@@ -1945,6 +2062,109 @@ GH.Tutorial = class Tutorial {
     this.objs.forEach((o) => s.tweens.add({ targets: o, alpha: 0, duration: 250, onComplete: () => o.destroy() }));
     s.hint('start', result === 'done' ? '준비 완료! 버그를 모두 정화하고 오른쪽 끝 게이트로 가세요' : '버그를 모두 정화하고 오른쪽 끝 게이트로 가세요', true);
   }
+};
+
+
+// ===== src/items.js =====
+// 아이템: 적이 쓰러질 때 확률적으로 떨어짐. 회복과 탄약은 바로 적용, 특수 아이템은 1칸 보관 후 V로 사용
+window.GH = window.GH || {};
+
+GH.ITEMS = {
+  hp10:   { label: '+10',  heal: 10,  color: 0xff6b9a, name: 'HP +10' },
+  hp30:   { label: '+30',  heal: 30,  color: 0xff4f7a, name: 'HP +30' },
+  hp50:   { label: '+50',  heal: 50,  color: 0xff3060, name: 'HP +50' },
+  hpfull: { label: 'MAX',  heal: 999, color: 0xffe14f, name: 'HP 풀충전' },
+  ammo:   { label: '+1',   ammo: 1,   color: 0x35f2ff, name: '탄약 +1' },
+  shield: { label: '',     stored: true, color: 0xffd34f, name: '완전 방패', desc: '4초 무적' },
+  rapid:  { label: '',     stored: true, color: 0xff8a3b, name: '따발총', desc: '5초 연사' },
+};
+
+GH.Items = {
+  // 드롭 확률과 비율 (config.items)
+  maybeDrop(scene, e) {
+    const c = GH.CONFIG.items;
+    const chance = e.mini ? c.miniDropChance : c.dropChance;
+    if (Math.random() >= chance) return;
+    this.spawn(scene, e.deathX, e.deathY - 10, this.roll(c.weights));
+  },
+
+  roll(weights) {
+    const total = Object.values(weights).reduce((a, b) => a + b, 0);
+    let r = Math.random() * total;
+    for (const [k, w] of Object.entries(weights)) { r -= w; if (r <= 0) return k; }
+    return 'hp10';
+  },
+
+  spawn(scene, x, y, type) {
+    const def = GH.ITEMS[type];
+    const icon = scene.add.image(x, y, 'item_' + (type.startsWith('hp') ? 'hp' : type)).setDepth(9);
+    if (type.startsWith('hp')) icon.setTint(def.color);
+    const label = scene.add.text(x, y + 16, def.label, {
+      fontFamily: 'Pretendard, sans-serif', fontSize: '11px', fontStyle: 'bold', color: '#ffffff', stroke: '#000000', strokeThickness: 3,
+    }).setOrigin(0.5).setDepth(9);
+    const it = { type, def, icon, label, x, y, vy: -220, born: scene.time.now, ground: GH.CONFIG.world.groundY - 14 };
+    if (!scene.items) scene.items = [];
+    scene.items.push(it);
+  },
+
+  update(scene, time) {
+    if (!scene.items) return;
+    const p = scene.player;
+    const dt = scene.game.loop.delta / 1000;
+    const life = GH.CONFIG.items.lifetime;
+    scene.items = scene.items.filter((it) => {
+      // 튀어 올랐다 떨어진 뒤 둥실둥실
+      if (it.vy !== null) {
+        it.vy += 900 * dt;
+        it.y += it.vy * dt;
+        if (it.y >= it.ground) { it.y = it.ground; it.vy = null; }
+      }
+      const bob = it.vy === null ? Math.sin(time / 200 + it.x) * 3 : 0;
+      // 가까우면 끌려옴
+      const dx = p.sprite.x - it.x, dy = p.sprite.y - it.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 70 && p.state !== 'dead') { it.x += dx * 0.18; it.y += dy * 0.18; }
+      it.icon.setPosition(it.x, it.y + bob);
+      it.label.setPosition(it.x, it.y + bob + 16);
+      const age = time - it.born;
+      const blink = age > life - 2500 && Math.floor(time / 120) % 2;
+      it.icon.setAlpha(blink ? 0.3 : 1);
+      it.label.setAlpha(blink ? 0.3 : 1);
+      if (dist < 24 && p.state !== 'dead' && age > 250) { this.pickup(scene, it); return false; }
+      if (age > life) { it.icon.destroy(); it.label.destroy(); return false; }
+      return true;
+    });
+  },
+
+  pickup(scene, it) {
+    const p = scene.player;
+    const def = it.def;
+    it.icon.destroy(); it.label.destroy();
+    GH.Sfx.item();
+    scene.burst(it.x, it.y, 10, def.color);
+    if (def.heal) {
+      const before = p.hp;
+      p.hp = Math.min(p.cfg.maxHp, p.hp + def.heal);
+      scene.popText(p.sprite.x, p.sprite.y - 60, def.heal >= 999 ? 'HP MAX!' : `+${p.hp - before} HP`, '#ff6b9a', 18);
+    } else if (def.ammo) {
+      p.ammo = Math.min(p.cfg.shot.maxAmmo, p.ammo + def.ammo);
+      scene.popText(p.sprite.x, p.sprite.y - 60, '+1 탄약', '#35f2ff', 16);
+    } else if (def.stored) {
+      const replaced = p.item;
+      p.item = it.type;
+      scene.popText(p.sprite.x, p.sprite.y - 60, def.name + '!', '#ffe14f', 18);
+      if (replaced && replaced !== it.type) scene.toast(`${GH.ITEMS[replaced].name} 대신 ${def.name}을(를) 들었어요`);
+    }
+    scene.hint('item', def.stored
+      ? `${def.name} 획득! V 키로 사용하세요 (${def.desc}). 특수 아이템은 하나만 들 수 있어요`
+      : '아이템 획득! 회복과 탄약은 바로 적용돼요. 특수 아이템은 V 키로 사용해요');
+    GH.Run.itemEvent('pickup', it.type);
+  },
+
+  clear(scene) {
+    (scene.items || []).forEach((it) => { it.icon.destroy(); it.label.destroy(); });
+    scene.items = [];
+  },
 };
 
 
@@ -2606,6 +2826,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     this.ovHint = null;
     this.hintObjs = null;
     this.hintQueue = [];
+    this.items = [];
     this.victory = false;
 
     this.physics.world.setBounds(0, 0, W, H);
@@ -2779,6 +3000,9 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     // 지형 장애물
     this.hazards.forEach((h) => h.update(time, this.player));
 
+    // 아이템
+    GH.Items.update(this, time);
+
     // 에너지 파동 이동과 명중
     this.updateWaves();
 
@@ -2817,6 +3041,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     // 게이트 진입
     if (this.gateOpen && !this.cleared && Math.abs(this.player.sprite.x - this.gate.x) < 40) {
       this.cleared = true;
+      GH.Run.carryItem = this.player.item;   // 특수 아이템은 다음 섹터로
       GH.Run.endAttempt('clear', { hp_left: this.player.hp });
       this.cameras.main.fadeOut(400, 0, 0, 0);
       this.time.delayedCall(450, () => this.scene.start(this.L.next));
@@ -2905,6 +3130,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
 
   onEnemyKilled(e) {
     this.kills += 1;
+    GH.Items.maybeDrop(this, e);
     this.burst(e.deathX, e.deathY, 26, GH.COLORS.neonPurple);
     if (this.kills >= this.totalEnemies) {
       this.time.delayedCall(500, () => {
@@ -2996,6 +3222,7 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     // 총구 섬광
     const m = this.add.circle(x, y, 8, GH.COLORS.neonCyan).setDepth(12);
     this.tweens.add({ targets: m, scale: 0.2, alpha: 0, duration: 90, onComplete: () => m.destroy() });
+    return b;
   }
 
   popBullet(b) {
@@ -3130,10 +3357,15 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
         px += a.width + 6;
       }
     });
-    this.add.text(940, 16, '← → 이동   ↑/Space 점프   Z 공격   ↑+Z 올려베기   C 사격   ↓ 방패   X 대시   M 소리', { ...font, fontSize: '13px' })
+    this.add.text(940, 16, '← → 이동  ↑/Space 점프  Z 공격  ↑+Z 올려베기  C 사격  ↓ 방패  X 대시  V 아이템  M 소리', { ...font, fontSize: '13px' })
       .setOrigin(1, 0).setScrollFactor(0).setDepth(100).setAlpha(0.8);
     this.add.text(20, 72, 'HP', { ...font, fontSize: '12px' }).setScrollFactor(0).setDepth(100);
     // 대시, 방패, 탄창은 캐릭터 옆에 표시 (player.drawUI)
+    // 특수 아이템 칸 (V로 사용)
+    this.itemBox = this.add.rectangle(36, 106, 30, 30, 0x0a0618, 0.85).setStrokeStyle(2, GH.COLORS.neonYellow).setScrollFactor(0).setDepth(100);
+    this.itemIcon = this.add.image(36, 106, 'item_shield').setScrollFactor(0).setDepth(101).setVisible(false);
+    this.itemText = this.add.text(58, 106, '', { ...font, fontSize: '12px', color: '#ffe14f' }).setOrigin(0, 0.5).setScrollFactor(0).setDepth(100);
+    this.add.text(36, 126, 'V', { ...font, fontSize: '10px', color: '#b9a8e8' }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(100);
     this.enemyText = this.add.text(940, 40, '', { ...font, fontSize: '14px', color: '#ffe14f' }).setOrigin(1, 0).setScrollFactor(0).setDepth(100);
     this.comboText = this.add.text(940, 70, '', {
       ...font, fontSize: '28px', fontStyle: 'bold', color: '#ffe14f', stroke: '#ff4fd8', strokeThickness: 5,
@@ -3147,6 +3379,16 @@ GH.SectorScene = class SectorScene extends Phaser.Scene {
     g.clear();
     g.fillStyle(0x000000, 0.5).fillRect(72, 74, 160, 10);
     g.fillStyle(p.hp > 30 ? GH.COLORS.neonCyan : GH.COLORS.danger, 1).fillRect(72, 74, 160 * (p.hp / p.cfg.maxHp), 10);
+    // 특수 아이템 칸
+    if (p.item) {
+      this.itemIcon.setTexture('item_' + p.item).setVisible(true);
+      this.itemText.setText(`${GH.ITEMS[p.item].name} (V)`);
+      this.itemBox.setStrokeStyle(2, Math.floor(time / 300) % 2 ? GH.COLORS.neonYellow : 0xffffff);
+    } else {
+      this.itemIcon.setVisible(false);
+      this.itemText.setText('');
+      this.itemBox.setStrokeStyle(2, 0x5a4a8a);
+    }
     this.enemyText.setText(`남은 버그 ${this.totalEnemies - this.kills} / ${this.totalEnemies}`);
   }
 };
@@ -3278,6 +3520,12 @@ GH.BossScene = class BossScene extends GH.SectorScene {
   onOverloadResult(success, leftRatio) {
     this.overloadResults.push(success);
     GH.Run.overloadResult(success, leftRatio);
+    // 무력화 성공 보상: 회복 + 특수 아이템
+    if (success) {
+      const b = this.boss.sprite;
+      GH.Items.spawn(this, b.x - 30, b.y - 20, 'hp30');
+      GH.Items.spawn(this, b.x + 30, b.y - 20, Math.random() < 0.5 ? 'shield' : 'rapid');
+    }
   }
 
   onEnemyKilled(e) {
